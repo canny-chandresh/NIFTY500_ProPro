@@ -1,0 +1,99 @@
+name: One-time Backfill (60d Yahoo → datalake artifact)
+
+on:
+  workflow_dispatch: {}   # run manually
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas yfinance pyarrow fastparquet
+
+      - name: Backfill 60d from Yahoo
+        run: |
+          python - <<'PY'
+          import os, sys, pandas as pd, yfinance as yf
+          from datetime import datetime, timedelta
+          from pathlib import Path
+
+          # --- Config ---
+          DL = Path("datalake")
+          OUT_PARQUET = DL / "daily_equity.parquet"
+          OUT_CSV_DIR = DL / "per_symbol"
+          BOOTSTRAP_DAYS = 60
+
+          DL.mkdir(parents=True, exist_ok=True)
+          OUT_CSV_DIR.mkdir(parents=True, exist_ok=True)
+
+          # --- Universe: prefer user-provided file, else fallback core list ---
+          # If you have your own universe, add a CSV at datalake/universe.csv with a column "Symbol"
+          uni_csv = DL / "universe.csv"
+          if uni_csv.exists():
+            u = pd.read_csv(uni_csv)
+            syms = [s.strip() for s in u['Symbol'].dropna().astype(str).tolist() if s.strip()]
+          else:
+            # Core liquid NIFTY names as a safe fallback (edit later to full NIFTY500)
+            syms = ["RELIANCE.NS","HDFCBANK.NS","ICICIBANK.NS","INFY.NS","TCS.NS",
+                    "SBIN.NS","KOTAKBANK.NS","LT.NS","BHARTIARTL.NS","ITC.NS",
+                    "AXISBANK.NS","HINDUNILVR.NS","BAJFINANCE.NS","MARUTI.NS","SUNPHARMA.NS",
+                    "ONGC.NS","NTPC.NS","TITAN.NS","WIPRO.NS","POWERGRID.NS"]
+
+          end = datetime.utcnow().date()
+          start = end - timedelta(days=BOOTSTRAP_DAYS)
+
+          all_rows = []
+          for i, sym in enumerate(syms, 1):
+            try:
+              print(f"[{i}/{len(syms)}] {sym} …", flush=True)
+              df = yf.download(sym, start=start, end=end, interval="1d", progress=False)
+              if df is None or df.empty:
+                print(f"  no data for {sym}")
+                continue
+              df = df.reset_index().rename(columns={
+                'Date':'Date','Open':'Open','High':'High','Low':'Low','Close':'Close','Adj Close':'AdjClose','Volume':'Volume'
+              })
+              df['Symbol'] = sym
+              # Save per-symbol CSV
+              df.to_csv(OUT_CSV_DIR / f"{sym.replace('.','_')}.csv", index=False)
+              all_rows.append(df)
+            except Exception as e:
+              print(f"  error {sym}: {e}")
+
+          if not all_rows:
+            print("No data fetched. Exiting.")
+            sys.exit(0)
+
+          full = pd.concat(all_rows, ignore_index=True)
+          # Write combined parquet
+          try:
+            full.to_parquet(OUT_PARQUET, index=False)
+          except Exception:
+            # fallback if pyarrow/fastparquet missing
+            full.to_csv(DL / "daily_equity.csv", index=False)
+
+          # small manifest
+          (DL / "manifest.txt").write_text(
+            f"symbols={len(syms)}\nrows={len(full)}\nstart={start}\nend={end}\n"
+          )
+
+          print("Backfill complete.")
+          PY
+
+      - name: Upload datalake as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: datalake-backfill
+          path: |
+            datalake/**
