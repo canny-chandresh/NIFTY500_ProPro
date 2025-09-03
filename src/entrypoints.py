@@ -1,6 +1,6 @@
 
 import json, os, datetime as _dt
-from .holidays import is_market_closed_today
+from holidays import is_market_closed_today
 
 def daily_update():
     if is_market_closed_today():
