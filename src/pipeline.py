@@ -69,12 +69,11 @@ def run_paper_session(top_k=5):
         except Exception: pass
     return top
 
-# (Optional) CSV append helpers (keep if you’re logging options/futures paper trades)
-import pandas as pd
-
+# Optional: CSV append helper if you log option/futures paper trades
 def _append_csv(df, path):
     if df is None or df.empty:
         return
+    import pandas as pd
     os.makedirs(os.path.dirname(path), exist_ok=True)
     if os.path.exists(path):
         base = pd.read_csv(path)
