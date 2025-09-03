@@ -15,24 +15,56 @@ jobs:
 
       - name: Ensure datalake exists (unpack once)
         run: |
-          if [ ! -d "datalake" ]; then
-            echo "No datalake/ found; unpacking bootstrap ZIP…"
-            if [ ! -f "datalake-bootstrap.zip" ]; then
-              echo "❌ datalake-bootstrap.zip not found in repo root. Upload it via 'Add file'."
-              exit 0
-            fi
-            sudo apt-get update -y >/dev/null 2>&1 || true
-            sudo apt-get install -y unzip >/dev/null 2>&1 || true
-            unzip -o datalake-bootstrap.zip -d .
-            # If your zip has a nested folder, auto-flatten it:
+          if [ -d "datalake" ]; then
+            echo "datalake/ already present; skipping unzip."
+            exit 0
+          fi
+
+          echo "No datalake/ found; unpacking bootstrap ZIP…"
+          # Accept either file name
+          if   [ -f "datalake-backfill.zip" ]; then ZIP_NAME="datalake-backfill.zip"
+          elif [ -f "datalake-bootstrap.zip" ]; then ZIP_NAME="datalake-bootstrap.zip"
+          else
+            echo "❌ Neither datalake-backfill.zip nor datalake-bootstrap.zip found in repo root."
+            exit 0
+          fi
+
+          sudo apt-get update -y >/dev/null 2>&1 || true
+          sudo apt-get install -y unzip >/dev/null 2>&1 || true
+
+          echo "Unzipping $ZIP_NAME …"
+          unzip -o "$ZIP_NAME" -d .
+
+          echo "Archive contents (first 100 lines):"
+          unzip -l "$ZIP_NAME" | sed -n '1,100p'
+
+          # ---- Normalize folder layout into ./datalake ----
+          if [ -d "datalake" ]; then
+            echo "Archive contained datalake/ already."
+          else
             if [ -d "NIFTY500_ProPro/datalake" ]; then
               mv NIFTY500_ProPro/datalake ./ && rm -rf NIFTY500_ProPro
+            elif [ -d "datalake-backfill/datalake" ]; then
+              mv datalake-backfill/datalake ./ && rm -rf datalake-backfill
+            elif [ -d "datalake-bootstrap/datalake" ]; then
+              mv datalake-bootstrap/datalake ./ && rm -rf datalake-bootstrap
+            else
+              mkdir -p datalake
+              [ -f "daily_equity.parquet" ] && mv daily_equity.parquet datalake/
+              [ -f "daily_equity.csv" ]     && mv daily_equity.csv datalake/
+              [ -f "manifest.txt" ]         && mv manifest.txt datalake/
+              [ -f "universe.csv" ]         && mv universe.csv datalake/
+              if [ -d "per_symbol" ]; then
+                mkdir -p datalake/per_symbol
+                mv per_symbol/* datalake/per_symbol/ || true
+                rmdir per_symbol || true
+              fi
             fi
-            echo "✅ Datalake ready:"
-            ls -la datalake || true
-          else
-            echo "datalake/ already present; skipping unzip."
           fi
+
+          echo "✅ Final datalake tree:"
+          ls -la datalake || true
+          [ -d datalake/per_symbol ] && (echo "== datalake/per_symbol ==" && ls -la datalake/per_symbol | head -n 50)
 
       - name: Show tree (sanity)
         run: |
@@ -77,7 +109,6 @@ jobs:
           if Path("src").exists():
               sys.path.append("src")
 
-          # Import modules defensively
           try:
               from entrypoints import daily_update, eod_task, periodic_reports_task, after_run_housekeeping
               from pipeline import run_paper_session
@@ -92,6 +123,5 @@ jobs:
           safe("periodic_reports_task()", lambda: periodic_reports_task())
           safe("after_run_housekeeping()", lambda: after_run_housekeeping())
 
-          # Always exit 0 so early wiring issues don't fail the job
           raise SystemExit(0)
           PY
