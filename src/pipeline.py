@@ -68,3 +68,21 @@ def run_paper_session(top_k=5):
         try: send_message(text)
         except Exception: pass
     return top
+# --- append helpers (add near the bottom of src/pipeline.py) ---
+import pandas as pd, os
+
+def _append_csv(df, path):
+    if df is None or df.empty:
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if os.path.exists(path):
+        base = pd.read_csv(path)
+        df = pd.concat([base, df], ignore_index=True)
+    df.to_csv(path, index=False)
+
+# Example usage inside run_paper_session(), AFTER 'top' is computed:
+# from options_executor import simulate_from_equity_recos
+# opt_df = simulate_from_equity_recos(top)
+# _append_csv(opt_df, "datalake/options_paper.csv")
+
+# (Do similarly for futures if you’ve added a futures simulator.)
