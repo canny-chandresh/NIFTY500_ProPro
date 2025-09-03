@@ -1,3 +1,23 @@
+      - name: Ensure datalake exists (unpack once)
+        run: |
+          if [ ! -d "datalake" ]; then
+            echo "No datalake/ found; unpacking bootstrap ZIP…"
+            if [ ! -f "datalake-bootstrap.zip" ]; then
+              echo "❌ datalake-bootstrap.zip not found in repo root. Upload it via 'Add file'."
+              exit 0
+            fi
+            sudo apt-get update -y >/dev/null 2>&1 || true
+            sudo apt-get install -y unzip >/dev/null 2>&1 || true
+            unzip -o datalake-bootstrap.zip -d .
+            # If your zip has a nested folder, auto-flatten it:
+            if [ -d "NIFTY500_ProPro/datalake" ]; then
+              mv NIFTY500_ProPro/datalake ./ && rm -rf NIFTY500_ProPro
+            fi
+            echo "✅ Datalake ready:"
+            ls -la datalake || true
+          else
+            echo "datalake/ already present; skipping unzip."
+          fi
 name: Hourly Train & Daily Notify
 on:
   schedule:
