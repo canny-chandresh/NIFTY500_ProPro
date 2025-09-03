@@ -1,3 +1,18 @@
+name: Hourly Train & Daily Notify
+
+on:
+  schedule:
+    - cron: "15 * * * 1-5"   # every weekday at :15
+  workflow_dispatch: {}       # enables the "Run workflow" button
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Ensure datalake exists (unpack once)
         run: |
           if [ ! -d "datalake" ]; then
@@ -18,18 +33,6 @@
           else
             echo "datalake/ already present; skipping unzip."
           fi
-name: Hourly Train & Daily Notify
-on:
-  schedule:
-    - cron: "15 * * * 1-5"
-  workflow_dispatch: {}
-jobs:
-  run:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
 
       - name: Show tree (sanity)
         run: |
@@ -81,7 +84,6 @@ jobs:
           except Exception as e:
               print("Import error:", e)
               traceback.print_exc()
-              # still exit 0 so job succeeds while we fix
               raise SystemExit(0)
 
           safe("daily_update()", lambda: daily_update())
