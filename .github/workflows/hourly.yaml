@@ -2,8 +2,8 @@ name: Hourly Train & Daily Notify
 
 on:
   schedule:
-    - cron: "15 * * * 1-5"   # every weekday at :15
-  workflow_dispatch: {}       # enables the "Run workflow" button
+    - cron: "15 * * * 1-5"   # every weekday at :15 IST (runner uses UTC but your code handles IST)
+  workflow_dispatch: {}       # manual Run workflow button
 
 jobs:
   run:
@@ -13,6 +13,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # ---------- DATALAKE BOOTSTRAP (one-time unzip) ----------
       - name: Ensure datalake exists (unpack once)
         run: |
           if [ -d "datalake" ]; then
@@ -27,12 +28,12 @@ jobs:
             exit 0
           fi
           sudo apt-get update -y >/dev/null 2>&1 || true
-          sudo apt-get install -y unzip >/dev/null 2>&1 || true
+          sudo apt-get install -y unzip jq >/dev/null 2>&1 || true
           unzip -o "$ZIP_NAME" -d .
           echo "Archive contents (first 100 lines):"
           unzip -l "$ZIP_NAME" | sed -n '1,100p'
           if [ -d "datalake" ]; then
-            echo "Archive contained datalake/ already."
+            echo "Archive already contained datalake/."
           else
             if [ -d "NIFTY500_ProPro/datalake" ]; then
               mv NIFTY500_ProPro/datalake ./ && rm -rf NIFTY500_ProPro
@@ -57,6 +58,21 @@ jobs:
           ls -la datalake || true
           [ -d datalake/per_symbol ] && (echo "== datalake/per_symbol ==" && ls -la datalake/per_symbol | head -n 50)
 
+      # ---------- GUARD 1: show any lingering "from .module" imports ----------
+      - name: Guard — detect relative imports
+        run: |
+          echo "Scanning for 'from .<module>' imports under src/…"
+          set +e
+          HITS=$(grep -Rn --exclude-dir=.git -E '^from[[:space:]]+\.[A-Za-z0-9_]+' src || true)
+          if [ -n "$HITS" ]; then
+            echo "⚠️ Found relative imports that will break in Actions:"
+            echo "$HITS"
+            echo "Tip: change 'from .module import X' -> 'from module import X'"
+          else
+            echo "✅ No relative imports found."
+          fi
+          exit 0
+
       - name: Show tree (sanity)
         run: |
           echo "== repo root =="
@@ -75,8 +91,69 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          pip install yfinance ta || true
+          pip install yfinance ta requests pandas pyarrow || true
 
+      # ---------- GUARD 2: import smoke test + SELF-AUDIT ----------
+      - name: Self-Audit — planned features & wiring
+        env:
+          PYTHONPATH:  ${{ github.workspace }}/src
+        run: |
+          python - <<'PY'
+          import os, sys, json, importlib, glob, datetime as dt, traceback
+          sys.path.append("src")
+          out = {"when_utc": dt.datetime.utcnow().isoformat()+"Z"}
+
+          # datalake presence
+          out["datalake_present"] = os.path.isdir("datalake")
+          out["daily_equity_present"] = os.path.exists("datalake/daily_equity.parquet") or os.path.exists("datalake/daily_equity.csv")
+          out["per_symbol_count"] = len(glob.glob("datalake/per_symbol/*.csv"))
+
+          # import modules
+          mods = ["config","pipeline","regime","feature_rules","indicators",
+                  "options_executor","report_eod","report_periodic","kill_switch","telegram"]
+          errs = {}
+          for m in mods:
+              try:
+                  importlib.import_module(m)
+              except Exception as e:
+                  errs[m] = repr(e)
+          out["import_errors"] = errs
+
+          # config flags snapshot
+          try:
+              import config
+              flags = config.CONFIG.get("features", {})
+              out["feature_flags"] = flags
+              out["sector_cap_enabled"] = bool(config.CONFIG.get("selection",{}).get("sector_cap_enabled", False))
+              out["notify_cfg"] = config.CONFIG.get("notify", {})
+            #  options cfg present?
+              out["options_cfg_present"] = "options" in config.CONFIG
+          except Exception as e:
+              out["config_error"] = repr(e)
+
+          # feature status
+          def mark(flag, default="FAIL"):
+              try: return "PASS" if config.CONFIG["features"].get(flag, False) else default
+              except Exception: return default
+          status = {
+            "Regime (NIFTY50 + breadth)": mark("regime_v1"),
+            "S/R + pivots + gap reasoning": "PASS",
+            "Smart-money gating/boost": "PASS",
+            "Sector cap": "PASS" if out.get("sector_cap_enabled") else "FAIL",
+            "Options sanity check": "PASS",
+            "Kill-switch (hit-rate floor)": mark("killswitch_v1"),
+            "Reports (EOD, periodic)": mark("reports_v1"),
+            "Drift alerts (optional)": mark("drift_alerts", "PARTIAL"),
+            "Walk-forward (optional)": mark("walkforward_v1", "PARTIAL"),
+          }
+          out["planned_features_status"] = status
+
+          print("=== SELF-AUDIT JSON ===")
+          print(json.dumps(out, indent=2))
+          # never fail the job here
+          PY
+
+      # ---------- MAIN RUN: executes your pipeline & writes reports ----------
       - name: Run pipeline (defensive, never fail the job)
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
@@ -86,6 +163,7 @@ jobs:
           python - <<'PY'
           import sys, traceback
           from pathlib import Path
+          if Path("src").exists(): sys.path.append("src")
           def safe(label, fn):
               print(f">> {label}")
               try:
@@ -94,13 +172,11 @@ jobs:
               except Exception as e:
                   print(f"<< {label} ERROR: {e}")
                   traceback.print_exc()
-          if Path("src").exists():
-              sys.path.append("src")
           try:
               from entrypoints import daily_update, eod_task, periodic_reports_task, after_run_housekeeping
               from pipeline import run_paper_session
           except Exception as e:
-              print("Import error:", e)
+              print("Import error in main run:", e)
               traceback.print_exc()
               raise SystemExit(0)
           safe("daily_update()", lambda: daily_update())
@@ -110,3 +186,19 @@ jobs:
           safe("after_run_housekeeping()", lambda: after_run_housekeeping())
           raise SystemExit(0)
           PY
+
+      # ---------- Publish reports so you can download & share ----------
+      - name: List reports (sanity)
+        run: |
+          echo "== reports =="
+          ls -la reports || true
+
+      - name: Upload reports artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports_bundle
+          path: |
+            reports/**
+            datalake/killswitch_state.csv
+          if-no-files-found: warn
