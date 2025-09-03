@@ -2,24 +2,26 @@ name: Hourly Train & Daily Notify
 
 on:
   schedule:
-    - cron: "15 * * * 1-5"   # every weekday at :15 IST (runner uses UTC but your code handles IST)
-  workflow_dispatch: {}       # manual Run workflow button
+    - cron: "15 * * * 1-5"     # every weekday at :15
+  workflow_dispatch: {}         # manual "Run workflow" button
 
 jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ---------- DATALAKE BOOTSTRAP (one-time unzip) ----------
+      # ---------- Ensure datalake exists (unzip once if needed) ----------
       - name: Ensure datalake exists (unpack once)
         run: |
           if [ -d "datalake" ]; then
             echo "datalake/ already present; skipping unzip."
             exit 0
           fi
+
           echo "No datalake/ found; unpacking bootstrap ZIP…"
           if   [ -f "datalake-backfill.zip" ]; then ZIP_NAME="datalake-backfill.zip"
           elif [ -f "datalake-bootstrap.zip" ]; then ZIP_NAME="datalake-bootstrap.zip"
@@ -27,11 +29,14 @@ jobs:
             echo "❌ Neither datalake-backfill.zip nor datalake-bootstrap.zip found in repo root."
             exit 0
           fi
+
           sudo apt-get update -y >/dev/null 2>&1 || true
           sudo apt-get install -y unzip jq >/dev/null 2>&1 || true
+
           unzip -o "$ZIP_NAME" -d .
           echo "Archive contents (first 100 lines):"
           unzip -l "$ZIP_NAME" | sed -n '1,100p'
+
           if [ -d "datalake" ]; then
             echo "Archive already contained datalake/."
           else
@@ -54,24 +59,28 @@ jobs:
               fi
             fi
           fi
+
           echo "✅ Final datalake tree:"
           ls -la datalake || true
           [ -d datalake/per_symbol ] && (echo "== datalake/per_symbol ==" && ls -la datalake/per_symbol | head -n 50)
 
-      # ---------- GUARD 1: show any lingering "from .module" imports ----------
-      - name: Guard — detect relative imports
+      # ---------- Auto-fix: convert ALL relative imports under src/ ----------
+      # This guarantees we won't hit "attempted relative import" errors.
+      # You can remove this step later once everything is clean in the repo.
+      - name: One-shot fix — convert ALL relative imports under src/
         run: |
-          echo "Scanning for 'from .<module>' imports under src/…"
-          set +e
-          HITS=$(grep -Rn --exclude-dir=.git -E '^from[[:space:]]+\.[A-Za-z0-9_]+' src || true)
-          if [ -n "$HITS" ]; then
-            echo "⚠️ Found relative imports that will break in Actions:"
-            echo "$HITS"
-            echo "Tip: change 'from .module import X' -> 'from module import X'"
-          else
-            echo "✅ No relative imports found."
-          fi
-          exit 0
+          echo "Before:"
+          grep -Rne '^[[:space:]]*from[[:space:]]+\.' src || true
+          grep -Rne '^[[:space:]]*import[[:space:]]+\.' src || true
+
+          while IFS= read -r -d '' f; do
+            sed -i -E 's/^[[:space:]]*from[[:space:]]+\.\s*([A-Za-z0-9_\.]+)[[:space:]]+import/from \1 import/g' "$f"
+            sed -i -E 's/^[[:space:]]*import[[:space:]]+\.\s*([A-Za-z0-9_\.]+)/import \1/g' "$f"
+          done < <(find src -type f -name "*.py" -print0)
+
+          echo "After:"
+          grep -Rne '^[[:space:]]*from[[:space:]]+\.' src || echo "✅ no relative 'from .' imports"
+          grep -Rne '^[[:space:]]*import[[:space:]]+\.' src || echo "✅ no relative 'import .' imports"
 
       - name: Show tree (sanity)
         run: |
@@ -79,8 +88,6 @@ jobs:
           ls -la
           echo "== src =="
           ls -la src || true
-          echo "== workflows =="
-          ls -la .github/workflows || true
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -93,67 +100,36 @@ jobs:
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           pip install yfinance ta requests pandas pyarrow || true
 
-      # ---------- GUARD 2: import smoke test + SELF-AUDIT ----------
+      # ---------- Self-Audit so you can see wiring status in logs ----------
       - name: Self-Audit — planned features & wiring
         env:
           PYTHONPATH:  ${{ github.workspace }}/src
         run: |
           python - <<'PY'
-          import os, sys, json, importlib, glob, datetime as dt, traceback
+          import os, sys, json, importlib, glob, datetime as dt
           sys.path.append("src")
           out = {"when_utc": dt.datetime.utcnow().isoformat()+"Z"}
-
-          # datalake presence
           out["datalake_present"] = os.path.isdir("datalake")
           out["daily_equity_present"] = os.path.exists("datalake/daily_equity.parquet") or os.path.exists("datalake/daily_equity.csv")
           out["per_symbol_count"] = len(glob.glob("datalake/per_symbol/*.csv"))
-
-          # import modules
-          mods = ["config","pipeline","regime","feature_rules","indicators",
-                  "options_executor","report_eod","report_periodic","kill_switch","telegram"]
           errs = {}
-          for m in mods:
-              try:
-                  importlib.import_module(m)
-              except Exception as e:
-                  errs[m] = repr(e)
+          for m in ["config","pipeline","regime","feature_rules","indicators","options_executor","report_eod","report_periodic","kill_switch","telegram"]:
+              try: importlib.import_module(m)
+              except Exception as e: errs[m] = repr(e)
           out["import_errors"] = errs
-
-          # config flags snapshot
           try:
               import config
-              flags = config.CONFIG.get("features", {})
-              out["feature_flags"] = flags
+              out["feature_flags"] = config.CONFIG.get("features", {})
               out["sector_cap_enabled"] = bool(config.CONFIG.get("selection",{}).get("sector_cap_enabled", False))
               out["notify_cfg"] = config.CONFIG.get("notify", {})
-            #  options cfg present?
               out["options_cfg_present"] = "options" in config.CONFIG
           except Exception as e:
               out["config_error"] = repr(e)
-
-          # feature status
-          def mark(flag, default="FAIL"):
-              try: return "PASS" if config.CONFIG["features"].get(flag, False) else default
-              except Exception: return default
-          status = {
-            "Regime (NIFTY50 + breadth)": mark("regime_v1"),
-            "S/R + pivots + gap reasoning": "PASS",
-            "Smart-money gating/boost": "PASS",
-            "Sector cap": "PASS" if out.get("sector_cap_enabled") else "FAIL",
-            "Options sanity check": "PASS",
-            "Kill-switch (hit-rate floor)": mark("killswitch_v1"),
-            "Reports (EOD, periodic)": mark("reports_v1"),
-            "Drift alerts (optional)": mark("drift_alerts", "PARTIAL"),
-            "Walk-forward (optional)": mark("walkforward_v1", "PARTIAL"),
-          }
-          out["planned_features_status"] = status
-
           print("=== SELF-AUDIT JSON ===")
           print(json.dumps(out, indent=2))
-          # never fail the job here
           PY
 
-      # ---------- MAIN RUN: executes your pipeline & writes reports ----------
+      # ---------- Run your pipeline & write reports ----------
       - name: Run pipeline (defensive, never fail the job)
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
@@ -187,11 +163,13 @@ jobs:
           raise SystemExit(0)
           PY
 
-      # ---------- Publish reports so you can download & share ----------
+      # ---------- Publish reports so you can download ----------
       - name: List reports (sanity)
         run: |
           echo "== reports =="
           ls -la reports || true
+          echo "== killswitch =="
+          ls -la datalake/killswitch_state.csv || true
 
       - name: Upload reports artifact
         if: always()
