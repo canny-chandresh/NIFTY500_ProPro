@@ -19,26 +19,18 @@ jobs:
             echo "datalake/ already present; skipping unzip."
             exit 0
           fi
-
           echo "No datalake/ found; unpacking bootstrap ZIP…"
-          # Accept either file name
           if   [ -f "datalake-backfill.zip" ]; then ZIP_NAME="datalake-backfill.zip"
           elif [ -f "datalake-bootstrap.zip" ]; then ZIP_NAME="datalake-bootstrap.zip"
           else
             echo "❌ Neither datalake-backfill.zip nor datalake-bootstrap.zip found in repo root."
             exit 0
           fi
-
           sudo apt-get update -y >/dev/null 2>&1 || true
           sudo apt-get install -y unzip >/dev/null 2>&1 || true
-
-          echo "Unzipping $ZIP_NAME …"
           unzip -o "$ZIP_NAME" -d .
-
           echo "Archive contents (first 100 lines):"
           unzip -l "$ZIP_NAME" | sed -n '1,100p'
-
-          # ---- Normalize folder layout into ./datalake ----
           if [ -d "datalake" ]; then
             echo "Archive contained datalake/ already."
           else
@@ -61,7 +53,6 @@ jobs:
               fi
             fi
           fi
-
           echo "✅ Final datalake tree:"
           ls -la datalake || true
           [ -d datalake/per_symbol ] && (echo "== datalake/per_symbol ==" && ls -la datalake/per_symbol | head -n 50)
@@ -84,18 +75,17 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          # Optional extras you may need later; keep non-fatal
           pip install yfinance ta || true
 
       - name: Run pipeline (defensive, never fail the job)
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID:  ${{ secrets.TG_CHAT_ID }}
+          PYTHONPATH:  ${{ github.workspace }}/src
         run: |
           python - <<'PY'
           import sys, traceback
           from pathlib import Path
-
           def safe(label, fn):
               print(f">> {label}")
               try:
@@ -104,11 +94,8 @@ jobs:
               except Exception as e:
                   print(f"<< {label} ERROR: {e}")
                   traceback.print_exc()
-
-          # Allow importing from src/
           if Path("src").exists():
               sys.path.append("src")
-
           try:
               from entrypoints import daily_update, eod_task, periodic_reports_task, after_run_housekeeping
               from pipeline import run_paper_session
@@ -116,12 +103,10 @@ jobs:
               print("Import error:", e)
               traceback.print_exc()
               raise SystemExit(0)
-
           safe("daily_update()", lambda: daily_update())
           safe("run_paper_session()", lambda: run_paper_session(top_k=5))
           safe("eod_task()", lambda: eod_task())
           safe("periodic_reports_task()", lambda: periodic_reports_task())
           safe("after_run_housekeeping()", lambda: after_run_housekeeping())
-
           raise SystemExit(0)
           PY
