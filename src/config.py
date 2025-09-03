@@ -18,14 +18,14 @@ def DL(name: str) -> str:
 
 CONFIG = {
     "features": {
-        "regime_v1": False,
-        "options_sanity": False,
-        "sr_pivots_v1": False,
-        "status_cmd": False,
-        "reports_v1": False,
-        "killswitch_v1": False,
-        "drift_alerts": False,
-        "walkforward_v1": False
+        "regime_v1": True,
+        "options_sanity": True,
+        "sr_pivots_v1": True,
+        "status_cmd": True,
+        "reports_v1": True,
+        "killswitch_v1": True,
+        "drift_alerts": True,
+        "walkforward_v1": True
     },
     "notify": {
         "send_only_at_ist": True,
