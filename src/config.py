@@ -1,21 +1,31 @@
-
+# src/config.py
 import os
 
 def DL(name: str) -> str:
-    """Resolve datalake file path by logical name."""
     base = os.environ.get("DL_BASE", "datalake")
     mapping = {
         "daily_equity": f"{base}/daily_equity.parquet",
-        "intraday_equity": f"{base}/intraday_equity.parquet",
-        "futures_daily": f"{base}/futures_daily.parquet",
+        "daily_equity_csv": f"{base}/daily_equity.csv",
+        "paper_trades": f"{base}/paper_trades.csv",
+        "paper_fills": f"{base}/paper_fills.csv",
+        "live_fills": f"{base}/live_fills.csv",
+        "sector_map": f"{base}/sector_map.csv",
+        "holidays": f"{base}/holidays_nse.csv",
+        "ban_list": f"{base}/ban_list.csv",
+        "universe": f"{base}/universe.csv"
     }
     return mapping.get(name, f"{base}/{name}.csv")
 
 CONFIG = {
-    "data": {
-        "bootstrap_days": 60,
-        "update_days": 5,
-        "universe": "NIFTY500"
+    "features": {
+        "regime_v1": False,
+        "options_sanity": False,
+        "sr_pivots_v1": False,
+        "status_cmd": False,
+        "reports_v1": False,
+        "killswitch_v1": False,
+        "drift_alerts": False,
+        "walkforward_v1": False
     },
     "notify": {
         "send_only_at_ist": True,
@@ -26,31 +36,10 @@ CONFIG = {
         "ist_eod_min": 5,
         "eod_window_min": 7
     },
-    "shadow_learning": {
-        "enabled": True,
-        "universe_scope": "broad",
-        "shadow_universe_cap": 500,
-        "slippage_bps": 12
-    },
     "selection": {
         "sector_cap_enabled": True,
         "sector_cap_k": 2,
         "sector_map_csv": "sector_map.csv"
-    },
-    "holiday": {
-        "calendar_csv": "holidays_nse.csv",
-        "skip_weekends": True
-    },
-    "telegram_poll": {
-        "enabled": True,
-        "lookback_min": 15
-    },
-    "options": {
-        "enabled": True,
-        "style": "ATM",
-        "leverage_k": 8.0,
-        "max_loss_cap": 0.5,
-        "holding_days": 5
     },
     "regime": {
         "ema_short": 20,
@@ -58,9 +47,6 @@ CONFIG = {
         "breadth_ma": 50,
         "bull_breadth_min": 0.55,
         "bear_breadth_max": 0.45,
-        "high_vol_thr": 0.30,
-        "hysteresis_days": 3,
-        "prob_adjustments": {"bull": -0.03, "neutral": 0.0, "bear": 0.05},
         "risk_multipliers": {"bull": 1.0, "neutral": 0.85, "bear": 0.65},
     },
     "smart_money": {
@@ -68,10 +54,26 @@ CONFIG = {
         "proba_boost": 0.20,
         "weights": {"rvol":0.30,"obv":0.25,"adl":0.20,"rs":0.20,"range":0.05}
     },
-    "external_flows": {
-        "fii_dii_file": "fii_dii_flows.csv",
-        "deals_file": "block_bulk_deals.csv",
-        "weights": {"flows": 0.12, "deals": 0.08},
-        "deal_fresh_days": 5
+    "options": {
+        "enabled": True,
+        "style": "ATM",
+        "min_oi": 10000,
+        "min_volume": 1000,
+        "min_dte": 1,
+        "max_dte": 30,
+        "min_rr": 1.5
+    },
+    "killswitch": {
+        "winrate_floor": 0.30,
+        "recovery_floor": 0.45,
+        "floor_days": 3,
+        "recovery_days": 2,
+        "cool_off_days": 2
+    },
+    "drift": {
+        "psi_warn": 0.2,
+        "psi_alert": 0.3,
+        "ref_days": 30,
+        "cur_days": 5
     }
 }
