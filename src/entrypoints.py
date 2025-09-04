@@ -1,49 +1,58 @@
 # src/entrypoints.py
 from __future__ import annotations
-import os, pandas as pd
+import os, json, pandas as pd
 from telegram import send_message
 from report_eod import build_eod
 from report_periodic import build_periodic
 from kill_switch import evaluate_and_update
 from utils_time import should_send_now_ist
+from livefeeds import refresh_equity_data
 
 def daily_update():
-    print("daily_update(): OK (placeholder)")
+    print("daily_update(): pulling live equities via yfinance…")
+    os.makedirs("reports", exist_ok=True)
+    info = refresh_equity_data(days=60, interval="1d")
+    # stash source usage (equities)
+    sources = {"equities": info}
+    # if options_source.txt exists from pipeline, include it later there
+    path = "reports/sources_used.json"
+    if os.path.exists(path):
+        try:
+            prev = json.load(open(path))
+            prev.update(sources)
+            sources = prev
+        except Exception:
+            pass
+    json.dump(sources, open(path, "w"), indent=2)
+    print("daily_update():", sources)
     return True
 
 def eod_task():
-    print("eod_task(): building EOD report...")
+    print("eod_task(): building EOD report…")
     os.makedirs("reports", exist_ok=True)
     build_eod()
     return True
 
 def periodic_reports_task():
-    print("periodic_reports_task(): building periodic reports...")
+    print("periodic_reports_task(): building periodic reports…")
     os.makedirs("reports", exist_ok=True)
     build_periodic()
     return True
 
 def after_run_housekeeping():
-    print("after_run_housekeeping(): evaluating kill-switch...")
+    print("after_run_housekeeping(): evaluating kill-switch…")
     evaluate_and_update()
     return True
 
 def send_5pm_summary():
-    """
-    At 17:00 IST, send one compact Telegram with:
-      - counts & latest timestamps
-      - per-strategy first few rows
-    """
     if not should_send_now_ist(kind="eod"):
         print("send_5pm_summary(): outside EOD window; skipping.")
         return False
 
-    def exists(path): return os.path.exists(path)
-    def head(path, n=5):
-        try:
-            return pd.read_csv(path).head(n)
-        except Exception:
-            return None
+    def exists(p): return os.path.exists(p)
+    def head(p, n=5):
+        try: return pd.read_csv(p).head(n)
+        except: return None
 
     eq = "datalake/paper_trades.csv"
     op = "datalake/options_paper.csv"
@@ -66,7 +75,7 @@ def send_5pm_summary():
         if df is not None:
             parts.append("  _Latest Options samples:_")
             for r in df.itertuples():
-                parts.append(f"  - {r.Symbol} {r.Leg} {getattr(r,'Strike',0)} {r.Expiry} LTP {getattr(r,'EntryPrice',0):.2f} RR {getattr(r,'RR',0) or 0:.2f}")
+                parts.append(f"  - {r.Symbol} {r.Leg} {getattr(r,'Strike',0)} {getattr(r,'Expiry',None)} LTP {getattr(r,'EntryPrice',0):.2f} RR {getattr(r,'RR',0) or 0:.2f}")
     else:
         parts.append("• Options paper trades: 0")
 
