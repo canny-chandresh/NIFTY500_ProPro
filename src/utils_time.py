@@ -1,29 +1,36 @@
-
-from datetime import datetime, timezone
-try:
-    from zoneinfo import ZoneInfo
-except Exception:
-    ZoneInfo = None
-from .config import CONFIG
+# src/utils_time.py
+from __future__ import annotations
+import datetime as dt
+from config import CONFIG
 
 def _now_ist():
-    tz = ZoneInfo("Asia/Kolkata") if ZoneInfo else timezone.utc
-    return datetime.now(tz)
+    # IST = UTC + 5:30
+    return dt.datetime.utcnow() + dt.timedelta(hours=5, minutes=30)
 
-def should_send_now_ist():
-    if not CONFIG.get("notify",{}).get("send_only_at_ist", True):
-        return True
+def _in_window(now: dt.datetime, hh: int, mm: int, width_min: int) -> bool:
+    target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    delta = abs((now - target).total_seconds()) / 60.0
+    return delta <= max(1, int(width_min))
+
+def should_send_now_ist(kind: str = "reco") -> bool:
+    """
+    kind:
+      - 'reco'  -> use ist_send_hour/ist_send_min/window_min
+      - 'eod'   -> use ist_eod_hour/ist_eod_min/eod_window_min
+    """
+    cfg = CONFIG.get("notify", {})
     now = _now_ist()
-    HH = CONFIG["notify"]["ist_send_hour"]
-    MM = CONFIG["notify"]["ist_send_min"]
-    W  = CONFIG["notify"]["window_min"]
-    if now.hour != HH: return False
-    return abs(now.minute - MM) <= W
 
-def should_send_eod_now_ist():
-    n = _now_ist()
-    HH = CONFIG["notify"]["ist_eod_hour"]
-    MM = CONFIG["notify"]["ist_eod_min"]
-    W  = CONFIG["notify"]["eod_window_min"]
-    if n.hour != HH: return False
-    return abs(n.minute - MM) <= W
+    if not cfg.get("send_only_at_ist", True):
+        return True
+
+    if kind == "eod":
+        hh = int(cfg.get("ist_eod_hour", 17))
+        mm = int(cfg.get("ist_eod_min", 0))
+        width = int(cfg.get("eod_window_min", 10))
+    else:
+        hh = int(cfg.get("ist_send_hour", 15))
+        mm = int(cfg.get("ist_send_min", 15))
+        width = int(cfg.get("window_min", 6))
+
+    return _in_window(now, hh, mm, width)
