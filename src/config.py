@@ -1,79 +1,61 @@
 # src/config.py
-import os
-
-def DL(name: str) -> str:
-    base = os.environ.get("DL_BASE", "datalake")
-    mapping = {
-        "daily_equity": f"{base}/daily_equity.parquet",
-        "daily_equity_csv": f"{base}/daily_equity.csv",
-        "paper_trades": f"{base}/paper_trades.csv",
-        "paper_fills": f"{base}/paper_fills.csv",
-        "live_fills": f"{base}/live_fills.csv",
-        "sector_map": f"{base}/sector_map.csv",
-        "holidays": f"{base}/holidays_nse.csv",
-        "ban_list": f"{base}/ban_list.csv",
-        "universe": f"{base}/universe.csv"
-    }
-    return mapping.get(name, f"{base}/{name}.csv")
+"""
+Configuration for NIFTY500 Pro Pro screener.
+All tunable parameters are centralized here.
+"""
 
 CONFIG = {
-    "features": {
-        "regime_v1": True,
-        "options_sanity": True,
-        "sr_pivots_v1": True,
-        "status_cmd": True,
-        "reports_v1": True,
-        "killswitch_v1": True,
-        "drift_alerts": True,
-        "walkforward_v1": True
-    },
+    # --- Notifications ---
     "notify": {
+        # Recommendation alert (3:15 PM IST)
         "send_only_at_ist": True,
         "ist_send_hour": 15,
         "ist_send_min": 15,
-        "window_min": 3,
-        "ist_eod_hour": 16,
-        "ist_eod_min": 5,
-        "eod_window_min": 7
+        "window_min": 6,         # 6-minute window (cron safety)
+
+        # End-of-day / summary alert (5:00 PM IST)
+        "ist_eod_hour": 17,
+        "ist_eod_min": 0,
+        "eod_window_min": 10     # 10-minute window
     },
-    "selection": {
-        "sector_cap_enabled": True,
-        "sector_cap_k": 2,
-        "sector_map_csv": "sector_map.csv"
-    },
-    "regime": {
-        "ema_short": 20,
-        "ema_long": 200,
-        "breadth_ma": 50,
-        "bull_breadth_min": 0.55,
-        "bear_breadth_max": 0.45,
-        "risk_multipliers": {"bull": 1.0, "neutral": 0.85, "bear": 0.65},
-    },
-    "smart_money": {
-        "min_sms": 0.55,
-        "proba_boost": 0.20,
-        "weights": {"rvol":0.30,"obv":0.25,"adl":0.20,"rs":0.20,"range":0.05}
-    },
+
+    # --- Options settings ---
     "options": {
         "enabled": True,
-        "style": "ATM",
-        "min_oi": 10000,
-        "min_volume": 1000,
-        "min_dte": 1,
-        "max_dte": 30,
-        "min_rr": 1.5
+        "enable_live_nse": True,        # Pull real NSE option-chain when possible
+        "indices": ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"],
+        "rr_min": 1.2,                  # Minimum reward/risk filter
+        "lot_size": 1,                  # For paper trades
+        "ban_list": ["YESBANK", "SUZLON"]  # Ignore noisy names
     },
-    "killswitch": {
-        "winrate_floor": 0.30,
-        "recovery_floor": 0.45,
-        "floor_days": 3,
-        "recovery_days": 2,
-        "cool_off_days": 2
+
+    # --- Smart money integration ---
+    "smart_money": {
+        "proba_boost": 0.25,   # How much to tilt probabilities if SMS score > 0.5
+        "min_sms": 0.45        # Drop signals below this SMS confidence
     },
-    "drift": {
-        "psi_warn": 0.2,
-        "psi_alert": 0.3,
-        "ref_days": 30,
-        "cur_days": 5
+
+    # --- Feature toggles ---
+    "features": {
+        "regime_v1": True,        # Market regime detection (NIFTY50 + breadth)
+        "sr_pivots_v1": True,     # Support/resistance, pivots, EMA gap logic
+        "reports_v1": True,       # EOD + periodic reporting enabled
+        "killswitch_v1": True,    # Kill-switch if winrate drops
+        "drift_alerts": True,     # Data drift alerts
+        "walkforward_v1": True    # Walk-forward validation support
+    },
+
+    # --- Selection / risk ---
+    "selection": {
+        "sector_cap_enabled": True,   # Limit picks per sector
+        "max_per_sector": 2,
+        "fallback_on_empty": True
+    },
+
+    # --- Kill switch parameters ---
+    "kill_switch": {
+        "min_winrate": 0.3,      # Suspend if <30% winrate
+        "window_days": 3,        # … for 3 consecutive days
+        "recovery_days": 2       # Auto-resume after 2 good days
     }
 }
