@@ -1,81 +1,71 @@
-# src/live_train.py
 from __future__ import annotations
 import os, json, datetime as dt
-import pandas as pd
 
-def _utc_now_iso():
-    return dt.datetime.utcnow().isoformat() + "Z"
+def _utc_now_iso(): return dt.datetime.utcnow().isoformat() + "Z"
 
-def _mtime(path: str) -> float | None:
+def _mtime(path: str):
     try: return os.path.getmtime(path)
     except Exception: return None
 
-def _hours_since(ts: float | None) -> float:
-    if ts is None: return 1e9
-    return (dt.datetime.utcnow() - dt.datetime.utcfromtimestamp(ts)).total_seconds() / 3600.0
+def _age_hours(ts):
+    if ts is None: return 9e9
+    return (dt.datetime.utcnow() - dt.datetime.utcfromtimestamp(ts)).total_seconds()/3600.0
 
 def ensure_equities_fresh(max_age_hours: float = 6.0) -> dict:
     """
-    Make sure equity OHLCV is present and fresh enough for ML:
-      - If daily_equity.(parquet|csv) is missing or older than max_age_hours,
-        pull last 60d via livefeeds.refresh_equity_data().
-      - Always writes reports/sources_used.json 'equities' entry.
+    Ensure datalake/daily_equity.(parquet|csv) is present & fresh (<= max_age_hours).
+    If missing/stale → pull last 60d from yfinance via livefeeds.refresh_equity_data().
+    Merge result into reports/sources_used.json under 'equities'.
     """
-    from pathlib import Path
     os.makedirs("reports", exist_ok=True)
-    eq_parq = "datalake/daily_equity.parquet"
-    eq_csv  = "datalake/daily_equity.csv"
+    eqp = "datalake/daily_equity.parquet"
+    eqc = "datalake/daily_equity.csv"
+    age = min(_age_hours(_mtime(eqp)), _age_hours(_mtime(eqc)))
+    info = {"equities_source":"cached", "rows":0, "symbols":0, "age_hours": round(age,2)}
+    need = (not os.path.exists(eqp) and not os.path.exists(eqc)) or age > max_age_hours
 
-    age_h = min(_hours_since(_mtime(eq_parq)), _hours_since(_mtime(eq_csv)))
-    info = {"equities_source": "cached", "rows": 0, "symbols": 0, "age_hours": round(age_h,2)}
-
-    need_refresh = (not os.path.exists(eq_parq) and not os.path.exists(eq_csv)) or age_h > max_age_hours
-    if need_refresh:
+    if need:
         try:
             from livefeeds import refresh_equity_data
             ret = refresh_equity_data(days=60, interval="1d")
-            info.update(ret)   # equities_source, rows, symbols
+            info.update(ret)
         except Exception as e:
             info["equities_source"] = f"error:{type(e).__name__}"
 
-    # merge into sources_used.json
+    # merge
     try:
-        src_path = "reports/sources_used.json"
+        src_p = "reports/sources_used.json"
         data = {}
-        if os.path.exists(src_path):
-            import json as _json
-            data = _json.load(open(src_path))
+        if os.path.exists(src_p):
+            data = json.load(open(src_p))
         data["equities"] = info
-        json.dump(data, open(src_path, "w"), indent=2)
+        json.dump(data, open(src_p, "w"), indent=2)
     except Exception:
         pass
     return info
 
+def _try_call(mod, fn, label, out, **kw):
+    try:
+        m = __import__(mod, fromlist=[fn])
+        f = getattr(m, fn, None)
+        if callable(f):
+            f(**kw)
+            out["trained"].append(label)
+    except Exception as e:
+        out.setdefault("errors", {})[label] = f"{type(e).__name__}: {e}"
+
 def train_all_modes_if_available() -> dict:
     """
-    Call model training functions if they exist.
-    Safe no-ops if modules/methods are absent.
-    Writes reports/train_run.json summary.
+    Try trainers if they exist (safe no-ops if absent).
+    Writes reports/train_run.json.
     """
     out = {"when": _utc_now_iso(), "trained": []}
-
-    def _try(mod_name: str, fn_name: str, label: str, **kw):
-        try:
-            mod = __import__(mod_name, fromlist=[fn_name])
-            fn  = getattr(mod, fn_name, None)
-            if callable(fn):
-                fn(**kw)  # your train function signature should tolerate **kw
-                out["trained"].append(label)
-        except Exception as e:
-            out.setdefault("errors", {})[label] = f"{type(e).__name__}: {e}"
-
-    # adjust to your repo’s trainers; all are optional calls
-    _try("model_selector", "train_incremental_equity", "equity")
-    _try("model_selector", "train_incremental_intraday", "intraday")
-    _try("model_selector", "train_incremental_swing", "swing")
-    _try("model_selector", "train_incremental_long", "long")
-    _try("options_executor", "train_from_live_chain", "options")     # optional, only if you add it
-    _try("futures_executor", "train_from_live_futures", "futures")   # optional
+    _try_call("model_selector", "train_incremental_equity",   "equity",   out)
+    _try_call("model_selector", "train_incremental_intraday", "intraday", out)
+    _try_call("model_selector", "train_incremental_swing",    "swing",    out)
+    _try_call("model_selector", "train_incremental_long",     "long",     out)
+    _try_call("options_executor","train_from_live_chain",     "options",  out)
+    _try_call("futures_executor","train_from_live_futures",   "futures",  out)
 
     os.makedirs("reports", exist_ok=True)
     json.dump(out, open("reports/train_run.json","w"), indent=2)
