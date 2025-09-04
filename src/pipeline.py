@@ -1,6 +1,7 @@
 # src/pipeline.py
 """
 Main session runner:
+- ensures fresh live equity data (yfinance) and tries to train
 - pulls ranked equity recos from model_selector
 - applies smart-money tilt and sector caps
 - generates options & futures paper trades (NSE live preferred + synthetic fallback)
@@ -13,12 +14,13 @@ import os, json
 import datetime as dt
 import pandas as pd
 
-# ───── Safe imports with graceful fallbacks ─────
+# ───── Config ─────
 try:
     from config import CONFIG
 except Exception:
     CONFIG = {}
 
+# ───── Safe imports with graceful fallbacks ─────
 def _try_import(name, default=None):
     try:
         return __import__(name, fromlist=["*"])
@@ -35,8 +37,10 @@ _telegram      = _try_import("telegram")
 _report_eod    = _try_import("report_eod")
 _report_period = _try_import("report_periodic")
 
-# ───── Helpers ─────
+# live refresh + optional training
+_live_train    = _try_import("live_train")   # ensure_equities_fresh, train_all_modes_if_available
 
+# ───── Files/IO helpers ─────
 def _ensure_reports():
     os.makedirs("reports", exist_ok=True)
 
@@ -52,6 +56,7 @@ def _append_csv(df: pd.DataFrame, path: str):
             pass
     df.to_csv(path, index=False)
 
+# ───── Minimal dummy rows (first-run protection) ─────
 def _make_dummy_equity(top_k=5) -> pd.DataFrame:
     return pd.DataFrame([{
         "Timestamp": pd.Timestamp.utcnow().isoformat()+"Z",
@@ -90,6 +95,7 @@ def _force_write_minimum_logs(equity_df, opts_df, futs_df, top_k):
     _append_csv(opts_df,   "datalake/options_paper.csv")
     _append_csv(futs_df,   "datalake/futures_paper.csv")
 
+# ───── Feature transforms ─────
 def _apply_sms(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty or _smartmoney is None:
         return df
@@ -163,14 +169,12 @@ def _regime_tag() -> dict:
         return {"regime": "NA", "reason": "unavailable"}
 
 # ───── Options/Futures executors (live preferred + fallback), with source tags ─────
-
 def _opts_from_equity(rows_for_opts: pd.DataFrame):
     opts_source = "synthetic"
     opts_df = pd.DataFrame()
     try:
         from options_executor import simulate_from_equity_recos as _opts_sim
         res = _opts_sim(rows_for_opts)
-        # Support both (df, tag) and df-only implementations:
         if isinstance(res, tuple) and len(res) == 2:
             opts_df, opts_source = res
         else:
@@ -220,11 +224,24 @@ def _merge_sources_used(extra: dict):
     except Exception as e:
         print("sources_used.json write failed:", e)
 
-# ───── Main entry called by workflow ─────
+# ───── Telegram footer (source audit) ─────
+def _source_footer(eq_info, opts_source, opts_df, futs_source, futs_df) -> str:
+    eq_src  = (eq_info or {}).get("equities_source", "unknown")
+    eq_rows = (eq_info or {}).get("rows", 0)
+    op_rows = 0 if (opts_df is None or getattr(opts_df, "empty", True)) else len(opts_df)
+    fu_rows = 0 if (futs_df is None or getattr(futs_df, "empty", True)) else len(futs_df)
+    return (
+        "\n— _Sources_: "
+        f"Equities: {eq_src} ({eq_rows}) • "
+        f"Options: {opts_source} ({op_rows}) • "
+        f"Futures: {futs_source} ({fu_rows})"
+    )
 
+# ───── Main entry called by workflow ─────
 def run_paper_session(top_k: int = 5) -> pd.DataFrame:
     """
     Orchestrates one decision cycle:
+      - ensure live equity data & try training
       - choose & score symbols
       - apply smart-money and sector caps
       - generate options & futures paper trades
@@ -234,7 +251,20 @@ def run_paper_session(top_k: int = 5) -> pd.DataFrame:
     status = _kill_status()
     regime = _regime_tag()
 
-    # 1) predictions from model_selector
+    # 1) Ensure we have fresh live equities (uses yfinance) and try training
+    eq_info = {}
+    if _live_train is not None:
+        try:
+            eq_info = _live_train.ensure_equities_fresh(max_age_hours=6.0)
+            print(f"[EQUITIES] source={eq_info.get('equities_source')} "
+                  f"rows={eq_info.get('rows')} symbols={eq_info.get('symbols')} "
+                  f"age_h={eq_info.get('age_hours')}")
+            train_summary = _live_train.train_all_modes_if_available()
+            print(f"[TRAIN] {train_summary}")
+        except Exception as e:
+            print("live_train step failed:", e)
+
+    # 2) predictions from model_selector
     preds, which_full = pd.DataFrame(), "light"
     try:
         if _model_selector and hasattr(_model_selector, "choose_and_predict_full"):
@@ -246,7 +276,7 @@ def run_paper_session(top_k: int = 5) -> pd.DataFrame:
     if preds is None:
         preds = pd.DataFrame()
 
-    # 2) smart-money tilt, then sector-cap & top-k
+    # 3) smart-money tilt, then sector-cap & top-k
     preds = _apply_sms(preds)
     top = pd.DataFrame()
     if not preds.empty:
@@ -257,33 +287,34 @@ def run_paper_session(top_k: int = 5) -> pd.DataFrame:
         top = _sector_cap(preds, top_k=top_k)
         top = _enrich_reasons(top)
 
-    # 3) Options (live preferred + fallback) and Futures
+    # 4) Options (live preferred + fallback) and Futures
     rows_for_derivs = top if not top.empty else preds.head(top_k)
     opts_df, opts_source = _opts_from_equity(rows_for_derivs)
     futs_df, futs_source = _futs_from_equity(rows_for_derivs)
 
-    # merge source tags for auditing
+    # record which sources were used
     _merge_sources_used({
         "options":  {"options_source":  opts_source,  "rows": 0 if opts_df is None else len(opts_df)},
         "futures":  {"futures_source":  futs_source,  "rows": 0 if futs_df is None else len(futs_df)},
     })
 
-    # 4) Always write paper logs (ensures visible training signals)
+    # 5) Always write paper logs (ensures visible training signals)
     _force_write_minimum_logs(top, opts_df, futs_df, top_k)
 
-    # 5) Telegram reco message
+    # 6) Build Telegram text with icons & footer
+    footer = _source_footer(eq_info, opts_source, opts_df, futs_source, futs_df)
+
     if status == "SUSPENDED" and CONFIG.get("features", {}).get("killswitch_v1", False):
         text = (
             f"*Top {top_k} — SUSPENDED by Kill-Switch*  ({ts})\n"
             f"_Reason: Win-rate below floor_\n"
             f"Regime: {regime.get('regime')} ({regime.get('reason')})"
         )
+        text += footer
     else:
+        # 📈 Equity list
+        eq_lines = []
         rows = top if not top.empty else preds.head(top_k)
-        lines = [
-            f"*Top {top_k} — NIFTY500 Pro Pro ({str(which_full).upper()} + SMS)*  ({ts})",
-            f"_Regime: {regime.get('regime')} ({regime.get('reason')})_"
-        ]
         for i, r in enumerate(rows.itertuples(), 1):
             entry = getattr(r, "Entry", 0.0)
             sl    = getattr(r, "SL", 0.0)
@@ -291,16 +322,48 @@ def run_paper_session(top_k: int = 5) -> pd.DataFrame:
             prob  = getattr(r, "proba", 0.0)
             sms   = getattr(r, "sms_score", 0.5) if hasattr(r, "sms_score") else 0.5
             rsn   = getattr(r, "Reason", "")
-            lines.append(
+            eq_lines.append(
                 f"{i}. *{r.Symbol}*  Buy {entry:.2f}  SL {sl:.2f}  Tgt {tgt:.2f}  "
                 f"Prob {prob:.2f}  SMS {sms:.2f}\n    _{rsn}_"
             )
-        text = "\n".join(lines)
 
+        # 📝 Options preview (up to 3 rows)
+        opt_lines = []
+        if opts_df is not None and not opts_df.empty:
+            for rr in opts_df.head(3).itertuples():
+                opt_lines.append(
+                    f"- {getattr(rr,'Symbol','?')} {getattr(rr,'Leg','?')} "
+                    f"{getattr(rr,'Strike', '')} {getattr(rr,'Expiry', '')}  "
+                    f"Entry {getattr(rr,'EntryPrice',0):.2f}  RR { (getattr(rr,'RR',0) or 0):.2f}"
+                )
+
+        # 📦 Futures preview (up to 3 rows)
+        fut_lines = []
+        if futs_df is not None and not futs_df.empty:
+            for rr in futs_df.head(3).itertuples():
+                fut_lines.append(
+                    f"- {getattr(rr,'Symbol','?')} {getattr(rr,'Expiry','')}  "
+                    f"Entry {getattr(rr,'EntryPrice',0):.2f}  "
+                    f"SL {getattr(rr,'SL',0):.2f}  Tgt {getattr(rr,'Target',0):.2f}"
+                )
+
+        lines = [
+            f"*Top {top_k} — NIFTY500 Pro Pro ({str(which_full).upper()} + SMS)*  ({ts})",
+            f"_Regime: {regime.get('regime')} ({regime.get('reason')})_",
+            "",
+            "📈 *Equity picks*",
+            *eq_lines
+        ]
+        if opt_lines:
+            lines += ["", "📝 *Options (paper)*", *opt_lines]
+        if fut_lines:
+            lines += ["", "📦 *Futures (paper)*", *fut_lines]
+
+        text = "\n".join(lines) + footer
+
+    # write preview + send within IST window
     _ensure_reports()
     open("reports/telegram_sample.txt", "w").write(text)
-
-    # gate the live send to your IST window
     if _should_send_now(kind="reco"):
         _send_telegram(text)
 
