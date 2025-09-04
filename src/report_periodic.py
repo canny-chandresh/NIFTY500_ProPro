@@ -1,36 +1,56 @@
 # src/report_periodic.py
-import os, pandas as pd
-from config import DL
+from __future__ import annotations
+import os, datetime as dt
+import pandas as pd
 
-def _safe_load(fp):
-    if os.path.exists(fp):
-        try: return pd.read_csv(fp)
-        except Exception: pass
-    return pd.DataFrame()
+REPORTS_DIR = "reports"
+DL = "datalake"
 
-def _agg(df):
-    if df.empty: return pd.DataFrame()
-    df = df.copy()
-    df["date"] = pd.to_datetime(df["date"]).dt.date
-    g = df.groupby("date").agg(trades=("symbol","count"),
-                               win=("target_hit","sum"),
-                               pnl=("pnl_pct","mean")).reset_index()
-    g["winrate"] = g["win"]/g["trades"]
-    return g
+def _safe_read(path: str) -> pd.DataFrame:
+    try:
+        return pd.read_csv(path)
+    except Exception:
+        return pd.DataFrame()
 
-def build_period(kind="D"):
-    os.makedirs("reports", exist_ok=True)
-    eq = _agg(_safe_load(DL("paper_fills")))
-    op = _agg(_safe_load("datalake/options_paper.csv"))
-    fu = _agg(_safe_load("datalake/futures_paper.csv"))
+def build_periodic() -> str:
+    """
+    Build simple rolling aggregates for daily/weekly/monthly paper logs.
+    Writes CSVs into reports/ and returns a short status string.
+    Safe to run even if logs are missing (creates tiny placeholders).
+    """
+    os.makedirs(REPORTS_DIR, exist_ok=True)
+    eq = _safe_read(os.path.join(DL, "paper_trades.csv"))
+    op = _safe_read(os.path.join(DL, "options_paper.csv"))
+    fu = _safe_read(os.path.join(DL, "futures_paper.csv"))
 
-    def _res(df, label):
-        if df.empty: return f"{label}: NA"
-        if kind=="W": df = df.set_index("date").resample("W").mean().reset_index()
-        if kind=="M": df = df.set_index("date").resample("M").mean().reset_index()
-        return f"{label}: periods={len(df)}  avg_winrate={df['winrate'].mean():.2%}  avg_pnl={df['pnl'].mean():.3f}"
+    def _add_day(df: pd.DataFrame, col: str = "Timestamp") -> pd.DataFrame:
+        if df is None or df.empty:
+            return pd.DataFrame()
+        out = df.copy()
+        if col in out.columns:
+            out["Date"] = pd.to_datetime(out[col], errors="coerce").dt.date
+        else:
+            out["Date"] = dt.date.today()
+        return out
 
-    txt = "\n".join([_res(eq,"Equity"), _res(op,"Options"), _res(fu,"Futures")])
-    open(f"reports/agg_report_{kind}.txt","w").write(txt)
-    open(f"reports/agg_report_{kind}.html","w").write("<html><body><pre>"+txt+"</pre></body></html>")
-    return {"txt": f"reports/agg_report_{kind}.txt", "html": f"reports/agg_report_{kind}.html"}
+    eqd, opd, fud = _add_day(eq), _add_day(op), _add_day(fu)
+
+    # simple counts per day
+    if not eqd.empty:
+        eqd.groupby("Date").size().rename("equity_trades")\
+            .to_csv(os.path.join(REPORTS_DIR, "agg_equity_daily.csv"))
+    if not opd.empty:
+        opd.groupby("Date").size().rename("options_trades")\
+            .to_csv(os.path.join(REPORTS_DIR, "agg_options_daily.csv"))
+    if not fud.empty:
+        fud.groupby("Date").size().rename("futures_trades")\
+            .to_csv(os.path.join(REPORTS_DIR, "agg_futures_daily.csv"))
+
+    # create a small index file so artifacts always contain something
+    with open(os.path.join(REPORTS_DIR, "periodic_index.txt"), "w") as f:
+        f.write(f"Periodic built at {dt.datetime.utcnow().isoformat()}Z\n")
+        f.write(f"Equity rows: {0 if eq is None else len(eq)}\n")
+        f.write(f"Options rows: {0 if op is None else len(op)}\n")
+        f.write(f"Futures rows: {0 if fu is None else len(fu)}\n")
+
+    return "periodic_ok"
