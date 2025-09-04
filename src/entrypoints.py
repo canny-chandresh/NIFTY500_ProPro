@@ -1,27 +1,50 @@
+# src/entrypoints.py
+"""
+Entry points for scheduled tasks (called by GitHub Actions).
+"""
 
-import json, os, datetime as _dt
-from holidays import is_market_closed_today
+from __future__ import annotations
+import os
+from pipeline import run_paper_session
+from report_eod import build_eod
+from report_periodic import build_periodic
+from kill_switch import evaluate_and_update
+from config import CONFIG
+
 
 def daily_update():
-    if is_market_closed_today():
-        return {"skipped":"holiday/weekend"}
-    # placeholder: data refresh would happen here
-    return {"ok": True}
+    """
+    Placeholder for any daily refresh tasks (e.g., ingesting new candles).
+    Currently a no-op.
+    """
+    print("daily_update(): OK (placeholder)")
+    return True
+
 
 def eod_task():
-    from .report_eod import build_eod
-    return build_eod()
+    """
+    End-of-day task: build the EOD report.
+    """
+    print("eod_task(): building EOD report...")
+    build_eod()
+    return True
+
 
 def periodic_reports_task():
-    from .report_periodic import build_period
-    return {"daily": build_period("D"),
-            "weekly": build_period("W"),
-            "monthly": build_period("M")}
+    """
+    Task to build aggregated periodic reports (daily/weekly/monthly).
+    """
+    print("periodic_reports_task(): building periodic reports...")
+    build_periodic()
+    return True
+
 
 def after_run_housekeeping():
-    try:
-        from .telegram import poll_and_respond_status
-        poll_and_respond_status()
-    except Exception:
-        pass
+    """
+    Housekeeping tasks after a run:
+    - evaluate kill-switch
+    - persist state if needed
+    """
+    print("after_run_housekeeping(): evaluating kill-switch...")
+    evaluate_and_update()
     return True
