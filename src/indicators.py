@@ -1,19 +1,18 @@
-# src/indicators.py
-import pandas as pd, numpy as np
+from __future__ import annotations
+import pandas as pd
 
-def ema(s: pd.Series, span: int):
-    return s.ewm(span=span, adjust=False).mean()
-
-def sma(s: pd.Series, n: int):
-    return s.rolling(n, min_periods=max(2, n//3)).mean()
-
-def rsi(close: pd.Series, n: int = 14):
-    delta = close.diff()
-    up = (delta.clip(lower=0)).rolling(n).mean()
-    down = (-delta.clip(upper=0)).rolling(n).mean()
-    rs = up / (down.replace(0, np.nan))
-    return 100 - (100 / (1 + rs))
-
-def pct_above_sma(close: pd.Series, n: int = 50):
-    ma = sma(close, n)
-    return (close > ma).rolling(n).mean()
+def add_gap_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Adds: prev_close, gap_abs, gap_pct, gap_dir, gap_fill_target, gap_reason
+    Expects at least: Date, Symbol, Open, Close
+    """
+    if df is None or df.empty:
+        return df
+    out = df.sort_values(["Symbol", "Date"]).copy()
+    out["prev_close"] = out.groupby("Symbol")["Close"].shift(1)
+    out["gap_abs"] = out["Open"] - out["prev_close"]
+    out["gap_pct"] = out["gap_abs"] / out["prev_close"]
+    out["gap_dir"] = out["gap_abs"].apply(lambda x: "up" if (pd.notna(x) and x > 0) else ("down" if (pd.notna(x) and x < 0) else "flat"))
+    out["gap_fill_target"] = out["prev_close"]
+    out["gap_reason"] = out.apply(lambda r: f"gap_{r.gap_dir} {round(100.0*float(r.gap_pct or 0), 2)}%", axis=1)
+    return out
