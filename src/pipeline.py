@@ -98,12 +98,24 @@ def run_paper_session(top_k=5):
 
     # 3) options simulation (NSE live preferred + fallback); also log source tag
     from options_executor import simulate_from_equity_recos
-    rows_for_opts = top if not top.empty else preds.head(top_k)
-    opts_df, opts_source = simulate_from_equity_recos(rows_for_opts)
-    os.makedirs("reports", exist_ok=True)
-    with open("reports/options_source.txt","w") as f:
-        f.write(opts_source + "\n")
-    print(f"[OPTIONS] source = {opts_source}, rows = {0 if opts_df is None else len(opts_df)}")
+ rows_for_opts = top if not top.empty else preds.head(top_k)
+opts_df, opts_source = simulate_from_equity_recos(rows_for_opts)
+os.makedirs("reports", exist_ok=True)
+with open("reports/options_source.txt","w") as f:
+    f.write(opts_source + "\n")
+# also merge into sources_used.json for a single place to audit the run
+try:
+    import json
+    src_path = "reports/sources_used.json"
+    sources = {}
+    if os.path.exists(src_path):
+        sources = json.load(open(src_path))
+    sources["options"] = {"options_source": opts_source, "rows": 0 if opts_df is None else len(opts_df)}
+    json.dump(sources, open(src_path,"w"), indent=2)
+except Exception as e:
+    print("sources_used.json write failed:", e)
+
+print(f"[OPTIONS] source = {opts_source}, rows = {0 if opts_df is None else len(opts_df)}")
 
     # (optional) futures simulator could be called here; using empty frame for now
     futs_df = pd.DataFrame()
