@@ -1,98 +1,121 @@
-# src/livefeeds.py
-"""
-Free live equity data (yfinance) with simple persistence into datalake.
-- Pulls last N days of OHLCV for your universe
-- Writes datalake/daily_equity.parquet and per_symbol/*.csv
-- Returns a dict with source + counts so pipeline can log it
-"""
-
 from __future__ import annotations
-import os, math
-from typing import Iterable, Dict
+import os, csv, json, datetime as dt
+from typing import List, Dict
 import pandas as pd
-import datetime as dt
 
+# Attempt to import yfinance; callers handle absence gracefully
 try:
     import yfinance as yf
 except Exception:
     yf = None
 
-DL_ROOT = "datalake"
+DL = "datalake"
+PER = os.path.join(DL, "per_symbol")
 
-def _ensure_dirs():
-    os.makedirs(DL_ROOT, exist_ok=True)
-    os.makedirs(os.path.join(DL_ROOT, "per_symbol"), exist_ok=True)
-
-def _load_universe_from_datalake() -> list[str]:
-    # try explicit universe.csv first
-    uni = os.path.join(DL_ROOT, "universe.csv")
-    if os.path.exists(uni):
-        s = pd.read_csv(uni)
-        c = "Symbol" if "Symbol" in s.columns else s.columns[0]
-        syms = [str(x).strip() for x in s[c].dropna().tolist()]
-        return [x for x in syms if x]
-
-    # else infer from existing per_symbol files
-    ps = os.path.join(DL_ROOT, "per_symbol")
-    if os.path.isdir(ps):
-        return [f.replace(".csv","") for f in os.listdir(ps) if f.endswith(".csv")]
-
-    # fallback tiny set if nothing present
-    return ["INFY.NS", "TCS.NS", "RELIANCE.NS", "HDFCBANK.NS", "ICICIBANK.NS"]
-
-def _normalize(sym: str) -> str:
-    s = str(sym).strip()
-    # add .NS if no exchange suffix present (best effort for India)
-    if "." not in s:
-        s = s + ".NS"
-    return s
-
-def _fetch_one(sym: str, days: int = 60, interval: str = "1d") -> pd.DataFrame:
-    if yf is None:
-        return pd.DataFrame()
-    t = yf.Ticker(sym)
-    # yfinance: using period keeps it simple and robust
-    try:
-        hist = t.history(period=f"{max(1, days)}d", interval=interval, auto_adjust=False, prepost=False)
-        if hist is None or hist.empty:
-            return pd.DataFrame()
-        hist = hist.reset_index().rename(columns={
-            "Date": "Date", "Open": "Open", "High": "High",
-            "Low": "Low", "Close": "Close", "Volume":"Volume"
-        })
-        hist["Symbol"] = sym
-        return hist[["Date","Symbol","Open","High","Low","Close","Volume"]]
-    except Exception:
-        return pd.DataFrame()
-
-def refresh_equity_data(symbols: Iterable[str] | None = None, days: int = 60, interval: str = "1d") -> Dict:
+def _load_symbol_universe() -> List[str]:
     """
-    Pulls equity OHLCV via yfinance and persists to datalake.
-    Returns: {"equities_source":"yfinance"|"none", "rows": int, "symbols": int}
+    Try to infer symbols from:
+    - datalake/per_symbol/*.csv (filenames as symbols)
+    - datalake/sector_map.csv (Symbol column)
+    Fall back to a small starter set if nothing found.
     """
-    _ensure_dirs()
-    if symbols is None:
-        symbols = _load_universe_from_datalake()
-
-    symbols = [_normalize(s) for s in symbols]
-    frames = []
-    for s in symbols:
-        df = _fetch_one(s, days=days, interval=interval)
-        if not df.empty:
-            frames.append(df)
-            # also write per_symbol
-            df.to_csv(os.path.join(DL_ROOT, "per_symbol", f"{s}.csv"), index=False)
-
-    if frames:
-        full = pd.concat(frames, ignore_index=True)
-        # coerce dtypes
-        full["Date"] = pd.to_datetime(full["Date"])
-        # write parquet and csv snapshot
+    syms = set()
+    if os.path.isdir(PER):
+        for f in os.listdir(PER):
+            if f.lower().endswith(".csv"):
+                syms.add(os.path.splitext(f)[0])
+    smap = os.path.join(DL, "sector_map.csv")
+    if os.path.exists(smap):
         try:
-            full.to_parquet(os.path.join(DL_ROOT, "daily_equity.parquet"), index=False)
+            df = pd.read_csv(smap)
+            if "Symbol" in df.columns:
+                syms.update(df["Symbol"].astype(str).str.upper().tolist())
         except Exception:
             pass
-        full.to_csv(os.path.join(DL_ROOT, "daily_equity.csv"), index=False)
-        return {"equities_source":"yfinance", "rows": int(len(full)), "symbols": int(full["Symbol"].nunique())}
+    # Minimal fallbacks (you can extend)
+    if not syms:
+        syms.update(["RELIANCE.NS", "TCS.NS", "INFY.NS", "^NSEI", "^NSEBANK"])
+    return sorted(syms)
+
+def refresh_equity_data(days: int = 60, interval: str = "1d") -> Dict:
+    """
+    Pull last `days` of OHLC for inferred universe; write:
+      - datalake/daily_equity.parquet + csv
+      - optionally datalake/per_symbol/<sym>.csv (head)
+    Returns a dict with source metadata.
+    """
+    os.makedirs(DL, exist_ok=True)
+    syms = _load_symbol_universe()
+    if yf is None:
+        # no yfinance available
+        return {"equities_source":"none", "rows":0, "symbols":0}
+
+    # yfinance: use multi-download
+    try:
+        hist = yf.download(
+            tickers=syms,
+            period=f"{max(1, days)}d",
+            interval=interval,
+            group_by="ticker",
+            auto_adjust=False,
+            threads=True,
+            progress=False
+        )
+    except Exception:
+        return {"equities_source":"error", "rows":0, "symbols":0}
+
+    # Normalize to long-form: Date, Symbol, Open, High, Low, Close, Volume
+    frames = []
+    if isinstance(hist.columns, pd.MultiIndex):
+        for sym in hist.columns.levels[0]:
+            try:
+                df = hist[sym].reset_index()
+                df["Symbol"] = str(sym)
+                df = df.rename(columns=str).rename(columns={"Adj Close":"AdjClose"})
+                df = df[["Date","Symbol","Open","High","Low","Close","Volume"]]
+                frames.append(df)
+            except Exception:
+                continue
     else:
-        return {"equities_source":"none", "rows": 0, "symbols": 0}
+        df = hist.reset_index()
+        df["Symbol"] = syms[0] if syms else "UNKNOWN"
+        df = df[["Date","Symbol","Open","High","Low","Close","Volume"]]
+        frames.append(df)
+
+    if not frames:
+        return {"equities_source":"yfinance", "rows":0, "symbols":0}
+
+    out = pd.concat(frames, ignore_index=True)
+    out["Date"] = pd.to_datetime(out["Date"])
+    # Save parquet + csv
+    out.to_parquet(os.path.join(DL, "daily_equity.parquet"), index=False)
+    out.to_csv(os.path.join(DL, "daily_equity.csv"), index=False)
+
+    # Optionally, refresh a few per_symbol heads for visibility
+    os.makedirs(PER, exist_ok=True)
+    for sym in out["Symbol"].dropna().astype(str).str.upper().unique()[:20]:
+        try:
+            head = out[out["Symbol"] == sym].tail(60)  # last 60 rows
+            head.to_csv(os.path.join(PER, f"{sym}.csv"), index=False)
+        except Exception:
+            pass
+
+    return {"equities_source":"yfinance", "rows": int(len(out)), "symbols": int(out['Symbol'].nunique())}
+
+def refresh_india_vix(days: int = 60) -> Dict:
+    """
+    Pull ^INDIAVIX daily (Close) and write datalake/indiavix.csv
+    """
+    os.makedirs(DL, exist_ok=True)
+    if yf is None:
+        return {"vix_source":"none","rows":0}
+    try:
+        t = yf.Ticker("^INDIAVIX")
+        hist = t.history(period=f"{max(1, days)}d", interval="1d")
+        if hist is None or hist.empty:
+            return {"vix_source":"none","rows":0}
+        df = hist.reset_index()[["Date","Close"]].rename(columns={"Close":"VIX"})
+        df.to_csv(os.path.join(DL, "indiavix.csv"), index=False)
+        return {"vix_source":"yfinance","rows":int(len(df))}
+    except Exception:
+        return {"vix_source":"none","rows":0}
