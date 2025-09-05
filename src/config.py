@@ -1,98 +1,87 @@
 # src/config.py
 """
-Central configuration for NIFTY500 Pro Pro.
-Tweak values here; all code reads from CONFIG.
+Global configuration for NIFTY500 Pro Pro Screener.
+All feature flags, notification windows, and source settings live here.
 """
 
 CONFIG = {
-    # ─────────────────────────────────────────────────────────────────────
-    # Notifications & time windows (IST)
-    # ─────────────────────────────────────────────────────────────────────
+    # ---- Core features ----
+    "features": {
+        "regime_v1": True,         # NIFTY50 + breadth + VIX + GIFT + News
+        "options_sanity": True,    # sanity checks on option strikes, expiry, IV
+        "sr_pivots_v1": True,      # support/resistance, pivots, gap reasoning
+        "status_cmd": True,        # respond to /status on Telegram
+        "reports_v1": True,        # generate EOD + periodic reports
+        "killswitch_v1": True,     # kill-switch when win-rate below floor
+        "drift_alerts": True,      # concept drift alerts
+        "walkforward_v1": True,    # walk-forward backtest / validation
+    },
+
+    # ---- Selection rules ----
+    "selection": {
+        "sector_cap_enabled": True,   # enforce sector diversification
+        "max_per_sector": 2,
+        "max_total": 5
+    },
+
+    # ---- Smart money ----
+    "smart_money": {
+        "proba_boost": 0.05,   # boost weight if smart money aligned
+        "min_sms": 0.45        # minimum smart money score to allow
+    },
+
+    # ---- Notifications ----
     "notify": {
-        # Recommendation alert window (3:15 PM IST)
         "send_only_at_ist": True,
         "ist_send_hour": 15,
         "ist_send_min": 15,
-        "window_min": 6,          # widen to tolerate GitHub runner jitter
-
-        # EOD/summary window (5:00 PM IST)
-        "ist_eod_hour": 17,
-        "ist_eod_min": 0,
-        "eod_window_min": 10
+        "window_min": 3,        # ± window for reco messages
+        "ist_eod_hour": 16,
+        "ist_eod_min": 5,
+        "eod_window_min": 7
     },
 
-    # ─────────────────────────────────────────────────────────────────────
-    # Options (NSE live preferred; synthetic fallback is inside options_executor)
-    # ─────────────────────────────────────────────────────────────────────
+    # ---- Options ----
     "options": {
         "enabled": True,
-        "enable_live_nse": True,              # try NSE public JSON
-        "indices": ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"],
-        "rr_min": 1.2,                        # min reward/risk for entries
-        "lot_size": 1,                        # paper logging only
-        "ban_list": ["YESBANK", "SUZLON"],    # optional noise filter
-        # If you want to forbid synthetic fallback, add:
-        # "allow_synthetic_fallback": True
+        "min_rr": 1.5,          # minimum reward/risk ratio
+        "max_sl_pct": 0.25      # stop-loss cap
     },
 
-    # ─────────────────────────────────────────────────────────────────────
-    # Futures (NSE live preferred; synthetic fallback is inside futures_executor)
-    # ─────────────────────────────────────────────────────────────────────
+    # ---- Futures ----
     "futures": {
-        "enable_live_nse": True,
-        "lot_size": 1                          # paper logging only
+        "enabled": True,
+        "lots_default": 1,
+        "max_sl_pct": 0.25
     },
 
-    # ─────────────────────────────────────────────────────────────────────
-    # Smart money gating/boost
-    # ─────────────────────────────────────────────────────────────────────
-    "smart_money": {
-        "proba_boost": 0.25,     # multiply proba by (1 + boost*(sms_score-0.5))
-        "min_sms": 0.45          # filter out rows with sms_score below this
+    # ---- Gift Nifty ----
+    "gift_nifty": {
+        "enabled": True,
+        "tickers": ["NIFTY", "^NSEI", "NSEI", "GIFTNIFTY", "GIFTNIFTY.NS"],
+        "days": 5
     },
 
-    # ─────────────────────────────────────────────────────────────────────
-    # Feature toggles
-    # ─────────────────────────────────────────────────────────────────────
-    "features": {
-        "regime_v1": True,       # NIFTY50 regime + breadth
-        "sr_pivots_v1": True,    # S/R, pivots, EMA gap, gap-fill reasoning tag
-        "reports_v1": True,      # report_eod / report_periodic hooks
-        "killswitch_v1": True,   # suspend if winrate < floor for N days
-        "drift_alerts": True,    # feature/data drift alerts (if wired)
-        "walkforward_v1": True   # walk-forward backtests (if wired)
-    },
-
-    # ─────────────────────────────────────────────────────────────────────
-    # Selection / risk constraints
-    # ─────────────────────────────────────────────────────────────────────
-    "selection": {
-        "sector_cap_enabled": True,
-        "max_per_sector": 2,
-        "fallback_on_empty": True
-    },
-
-    # ─────────────────────────────────────────────────────────────────────
-    # Kill switch parameters
-    # ─────────────────────────────────────────────────────────────────────
-    "kill_switch": {
-        "min_winrate": 0.30,   # suspend when below this
-        "window_days": 3,      # for this many consecutive days
-        "recovery_days": 2     # resume after this many good days
+    # ---- News pulse ----
+    "news": {
+        "enabled": True,
+        "feeds": [
+            "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms",
+            "https://www.moneycontrol.com/rss/marketreports.xml",
+            "https://www.livemint.com/rss/markets",
+            "https://www.business-standard.com/rss/markets-106.rss"
+        ],
+        "keywords_positive": [
+            "upgrade","beats","strong","surge","rally","grow","record","profit"
+        ],
+        "keywords_negative": [
+            "downgrade","misses","weak","plunge","fall","scam","fraud","default","loss"
+        ],
+        "lookback_hours": 6,
+        "high_risk_threshold": 3
     }
 }
 
-
-# Convenience: datalake path helpers (optional)
-import os
-def DL(name: str) -> str:
-    """
-    Map logical names to datalake files; used by some modules.
-    """
-    root = "datalake"
-    os.makedirs(root, exist_ok=True)
-    mapping = {
-        "daily_equity": os.path.join(root, "daily_equity.parquet"),
-        "daily_equity_csv": os.path.join(root, "daily_equity.csv"),
-    }
-    return mapping.get(name, os.path.join(root, name))
+if __name__ == "__main__":
+    import json
+    print(json.dumps(CONFIG, indent=2))
