@@ -1,85 +1,67 @@
 """
 Global configuration for NIFTY500 Pro Pro Screener.
-All feature flags, notification windows, and source settings live here.
 """
 
 CONFIG = {
     # ---- Core features ----
     "features": {
-        "regime_v1": True,         # VIX + (optional breadth/NIFTY) + GIFT + News
-        "options_sanity": True,    # sanity checks on option strikes/expiries
-        "sr_pivots_v1": True,      # S/R, pivots, gap reasoning
-        "status_cmd": True,        # /status on Telegram
-        "reports_v1": True,        # EOD + periodic reports
-        "killswitch_v1": True,     # hit-rate floor protection
-        "drift_alerts": True,      # feature drift alerts (light)
-        "walkforward_v1": True,    # walk-forward (light)
-        "dl_shadow": True,         # Deep Learning shadow training/eval
+        "regime_v1": True,
+        "options_sanity": True,
+        "sr_pivots_v1": True,
+        "status_cmd": True,
+        "reports_v1": True,
+        "killswitch_v1": True,     # (tabular) kill-switch
+        "drift_alerts": True,
+        "walkforward_v1": True,
+        "dl_shadow": True,         # Deep Learning: train/eval in shadow
     },
 
     # ---- Selection rules ----
-    "selection": {
-        "sector_cap_enabled": True,   # diversification by sector
-        "max_per_sector": 2,
-        "max_total": 5
-    },
+    "selection": {"sector_cap_enabled": True, "max_per_sector": 2, "max_total": 5},
 
-    # ---- Modes (AUTO vs ALGO) ----
+    # ---- Modes ----
     "modes": {
-        "auto_enabled": True,          # AUTO = curated 5 → messaged + paper
-        "algo_lab_enabled": True,      # ALGO = exploratory many (paper only)
-        "auto_top_k": 5,               # Auto sends 5 picks
-        "algo_max_trades": 30          # Algo Lab can place up to 30 paper trades
+        "auto_enabled": True,      # AUTO = curated 5 → messaged + paper
+        "algo_lab_enabled": True,  # ALGO = broad exploratory paper trades
+        "auto_top_k": 5,
+        "algo_max_trades": 30
     },
 
     # ---- Smart money ----
-    "smart_money": {
-        "proba_boost": 0.05,   # boost if SMS aligned
-        "min_sms": 0.45        # minimum SMS score to allow
-    },
+    "smart_money": {"proba_boost": 0.05, "min_sms": 0.45},
 
     # ---- Notifications (IST) ----
     "notify": {
         "send_only_at_ist": True,
-        "ist_send_hour": 15,       # recommendations ~3:15 PM IST
-        "ist_send_min": 15,
-        "window_min": 3,           # ±window for reco messages
-        "ist_eod_hour": 17,        # EOD ~5:00 PM IST
-        "ist_eod_min": 0,
-        "eod_window_min": 15
+        "ist_send_hour": 15, "ist_send_min": 15, "window_min": 3,
+        "ist_eod_hour": 17, "ist_eod_min": 0, "eod_window_min": 15
     },
 
     # ---- Data freshness & ingestion ----
     "data": {
-        "symbols_file": "datalake/symbols.csv",   # optional custom symbol list
-        "default_universe": 300,                  # cap symbols for free tier
+        "symbols_file": "datalake/symbols.csv",
+        "default_universe": 300,
         "fetch": {
-            "daily_days": 400,                    # ~2Y (improves DL)
-            "hourly_days": 60,                    # last 60 days for 60m bars
-            "minute_days": 5                      # 1m bars (Yahoo limit ~7d)
+            "daily_days": 400,      # ~2y
+            "hourly_days": 60,      # 60d 60m
+            "minute_days": 5        # last ~5-7d 1m
+        },
+        "hygiene": {
+            "utc_enforce": True,
+            "dedupe": True,
+            "sort_keys": ["Symbol","Datetime"],
+            "gap_flag": True,         # mark missing bars
+            "volume_zero_fill": True, # fill missing minute bars with Vol=0
+            "outlier_cap_z": 8.0      # soft cap for absurd OHLC/Vol spikes
         }
     },
 
-    # ---- Options ----
-    "options": {
-        "enabled": True,
-        "min_rr": 1.5,          # minimum reward/risk ratio
-        "max_sl_pct": 0.25      # stop-loss cap (fraction of entry)
-    },
+    # ---- Options / Futures ----
+    "options": {"enabled": True, "min_rr": 1.5, "max_sl_pct": 0.25},
+    "futures": {"enabled": True, "lots_default": 1, "max_sl_pct": 0.25},
 
-    # ---- Futures ----
-    "futures": {
-        "enabled": True,
-        "lots_default": 1,
-        "max_sl_pct": 0.25
-    },
-
-    # ---- GIFT Nifty (Yahoo tickers tried in order) ----
-    "gift_nifty": {
-        "enabled": True,
-        "tickers": ["^NSEI","^NSEBANK","NIFTY","NSEI","GIFTNIFTY","GIFTNIFTY.NS"],
-        "days": 10
-    },
+    # ---- GIFT Nifty & VIX ----
+    "gift_nifty": {"enabled": True, "tickers": ["^NSEI","^NSEBANK","GIFTNIFTY","NIFTY","NSEI"], "days": 10},
 
     # ---- News pulse (RSS) ----
     "news": {
@@ -98,20 +80,27 @@ CONFIG = {
 
     # ---- Deep Learning (shadow) ----
     "dl": {
-        "seq_len": 120,         # last 120 timesteps (hourly)
-        "horizon_h": 5,         # predict 5-hour ahead “up” probability
-        "max_symbols": 300,     # cap for runner time
-        "epochs": 2,            # short shadow training
-        "minutes_cap": 3,       # time box per run (minutes)
-        "ready_thresholds": {
+        "seq_len": 120,         # 120 hourly steps
+        "horizon_h": 5,         # 5-hour forward label
+        "max_symbols": 300,
+        "epochs": 2,
+        "minutes_cap": 3,       # time-box each run (minutes)
+        "ready_thresholds": {   # activation gates
             "min_symbols": 10,
             "min_epochs": 2,
             "hit_rate": 0.55,
             "brier_max": 0.25
+        },
+        # DL-specific kill-switch
+        "kill_switch": {
+            "window_runs": 6,           # last N eval runs
+            "min_test": 200,            # require N test samples for signal
+            "hit_rate_floor": 0.48,     # suspend if below floor
+            "consec_bad": 3,            # OR if this many bad runs in a row
+            "cooloff_hours": 24         # stay suspended for this long
         }
     }
 }
 
 if __name__ == "__main__":
-    import json
-    print(json.dumps(CONFIG, indent=2))
+    import json; print(json.dumps(CONFIG, indent=2))
