@@ -1,3 +1,4 @@
+# src/ai_policy.py
 from __future__ import annotations
 import os, json, datetime as dt
 import pandas as pd
@@ -5,6 +6,7 @@ from config import CONFIG
 
 AI_LOG = "reports/metrics/ai_policy_log.json"
 SUSPEND_FLAG = "reports/metrics/ai_policy_suspended.json"
+ALGO_FLAG = "reports/metrics/algo_live_flag.json"
 
 def _jload(path):
     if os.path.exists(path):
@@ -44,7 +46,6 @@ def _gift_trend():
 
 def _news_risk():
     s = _jload("reports/sources_used.json")
-    # If you aggregate news counts/sentiment, surface an integer risk 0..3 here.
     return int(s.get("news_risk", 0)) if isinstance(s, dict) else 0
 
 def _regime_hint():
@@ -61,21 +62,18 @@ def build_context():
     }
 
 def _maybe_suspend_policy() -> bool:
-    """
-    Suspend AI policy (fall back to safe defaults) if recent AUTO win-rate is too low.
-    """
     try:
         from metrics_tracker import summarize_last_n
         metr = summarize_last_n(days=5)
         wr = float((metr.get("AUTO") or {}).get("win_rate", 0.0))
-        suspended = wr < 0.40  # floor
+        suspended = wr < 0.40
         json.dump({"suspended": suspended, "wr": wr, "when_utc": dt.datetime.utcnow().isoformat()+"Z"},
                   open(SUSPEND_FLAG, "w"), indent=2)
         return suspended
     except Exception:
         return False
 
-def _thresholds_by_context(ctx: dict) -> dict:
+def _thresholds_by_context(ctx: dict, purpose: str) -> dict:
     thr = {
         "min_proba": 0.52,
         "sl_pct": 0.01,
@@ -107,29 +105,32 @@ def _thresholds_by_context(ctx: dict) -> dict:
     if news_risk >= 2:
         thr["min_proba"] += 0.02; thr["exposure_cap"] = min(thr["exposure_cap"], 0.65)
 
+    # Purpose adjustments (ALGO explores but smaller sizing)
+    if purpose == "algo":
+        thr["min_proba"] = max(0.50, thr["min_proba"] - 0.02)
+        thr["max_picks"] = min(3, int(CONFIG.get("modes", {}).get("algo_top_k", 10)))
+        thr["exposure_cap"] = min(thr["exposure_cap"], 0.50)  # keep smaller book for explore
+
     thr["min_proba"] = float(max(0.50, min(0.65, thr["min_proba"])))
     thr["sl_pct"]    = float(max(0.006, min(0.02, thr["sl_pct"])))
     thr["tp_pct"]    = float(max(0.008, min(0.03, thr["tp_pct"])))
-    thr["max_picks"] = int(max(3, min(8, thr["max_picks"])))
-    thr["exposure_cap"] = float(max(0.4, min(1.0, thr["exposure_cap"])))
+    thr["max_picks"] = int(max(1, min(8, thr["max_picks"])))
+    thr["exposure_cap"] = float(max(0.3, min(1.0, thr["exposure_cap"])))
     return thr
 
 def apply_policy(raw_df: pd.DataFrame, ctx: dict) -> pd.DataFrame:
-    """
-    Turn normalized picks (Symbol,Entry,SL,Target,proba,Reason)
-    into final decisions using thresholds/sizing.
-    """
     if raw_df is None or raw_df.empty:
         _save_log({"when_utc": ctx.get("when_utc"), "decisions": 0, "reason": "empty_raw"})
         return raw_df
 
-    # Suspension check (fallback to conservative)
+    # Suspension check
     if _maybe_suspend_policy():
         out = raw_df.sort_values("proba", ascending=False).head(3).reset_index(drop=True)
         _save_log({"when_utc": ctx.get("when_utc"), "decisions": len(out), "reason": "ai_policy_suspended"})
         return out
 
-    thr = _thresholds_by_context(ctx)
+    purpose = os.environ.get("RUN_PURPOSE", "auto").strip().lower()
+    thr = _thresholds_by_context(ctx, purpose)
     df = raw_df.copy()
 
     # Min confidence
@@ -138,7 +139,7 @@ def apply_policy(raw_df: pd.DataFrame, ctx: dict) -> pd.DataFrame:
         _save_log({"when_utc": ctx.get("when_utc"), "decisions": 0, "policy": thr, "reason": "min_proba_filter"})
         return df
 
-    # Uncertainty abstention (dispersion very low & mean barely above threshold)
+    # Uncertainty abstention
     disp = float(df["proba"].std()) if len(df) > 1 else 0.0
     if disp < 0.01 and df["proba"].mean() < (thr["min_proba"] + 0.01):
         _save_log({"when_utc": ctx.get("when_utc"), "decisions": 0, "policy": thr, "reason": "abstain_low_conf"})
@@ -157,9 +158,56 @@ def apply_policy(raw_df: pd.DataFrame, ctx: dict) -> pd.DataFrame:
 
     _save_log({
         "when_utc": ctx.get("when_utc"),
+        "purpose": purpose,
         "policy": thr,
         "in_raw": int(len(raw_df)),
         "out_final": int(len(df)),
         "avg_proba": float(df["proba"].mean()) if not df.empty else None
     })
     return df
+
+def decide_algo_live(ctx: dict) -> dict:
+    """
+    AI gatekeeper for ALGO going live. Writes reports/metrics/algo_live_flag.json
+    and returns the dict {"allowed": bool, "reason": str, "...": ...}
+    """
+    live_cfg = CONFIG.get("live", {})
+    rules = live_cfg.get("algo_live_rules", {})
+    enable_algo_live = bool(live_cfg.get("enable_algo_live", False))
+    conditional = bool(live_cfg.get("conditional_algo_live", True))
+    dry_run = bool(live_cfg.get("dry_run", True))
+
+    out = {"allowed": False, "dry_run": dry_run, "conditional": conditional, "enable_algo_live": enable_algo_live}
+
+    if not enable_algo_live:
+        out["reason"] = "enable_algo_live_false"
+    elif dry_run:
+        out["reason"] = "dry_run_true"
+    elif not conditional:
+        # if conditional is False but enable_algo_live True, we allow always (still subject to risk caps)
+        out["allowed"] = True
+        out["reason"] = "conditional_false_allow_all"
+    else:
+        # check metrics + context
+        try:
+            from metrics_tracker import summarize_last_n
+            metr = summarize_last_n(days=10)
+            auto_wr = float((metr.get("AUTO") or {}).get("win_rate", 0.0))
+        except Exception:
+            auto_wr = 0.0
+
+        vix = ctx.get("vix") or 99.0
+        regime = (ctx.get("regime") or "neutral").lower()
+
+        if auto_wr >= float(rules.get("auto_wr_min", 0.65)) and \
+           vix <= float(rules.get("vix_max", 14.0)) and \
+           regime in set([r.lower() for r in rules.get("regimes_ok", ["bull","neutral"])]):
+            out["allowed"] = True
+            out["reason"] = "conditions_met"
+        else:
+            out["reason"] = f"conditions_not_met wr={auto_wr:.2f} vix={vix} regime={regime}"
+
+    # persist the flag
+    os.makedirs(os.path.dirname(ALGO_FLAG) or ".", exist_ok=True)
+    json.dump({**out, "when_utc": dt.datetime.utcnow().isoformat()+"Z"}, open(ALGO_FLAG,"w"), indent=2)
+    return out
