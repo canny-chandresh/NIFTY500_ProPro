@@ -1,6 +1,16 @@
 from __future__ import annotations
 import pandas as pd
 
+def ema(series: pd.Series, span: int = 20) -> pd.Series:
+    """
+    Exponential Moving Average (EMA).
+    Safe fallback: returns rolling mean if ewm not available.
+    """
+    try:
+        return series.ewm(span=span, adjust=False).mean()
+    except Exception:
+        return series.rolling(window=span, min_periods=1).mean()
+
 def add_gap_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     Adds: prev_close, gap_abs, gap_pct, gap_dir, gap_fill_target, gap_reason
