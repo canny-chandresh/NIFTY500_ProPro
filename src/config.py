@@ -23,6 +23,14 @@ CONFIG = {
         "max_total": 5
     },
 
+    # ---- Modes (AUTO vs ALGO) ----
+    "modes": {
+        "auto_enabled": True,          # AUTO = curated 5 → messaged + paper
+        "algo_lab_enabled": True,      # ALGO = exploratory many (paper only)
+        "auto_top_k": 5,               # Auto sends 5 picks
+        "algo_max_trades": 30          # Algo Lab can place up to 30 paper trades
+    },
+
     # ---- Smart money ----
     "smart_money": {
         "proba_boost": 0.05,   # boost if SMS aligned
