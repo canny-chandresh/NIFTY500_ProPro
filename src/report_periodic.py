@@ -1,56 +1,91 @@
-# src/report_periodic.py
 from __future__ import annotations
-import os, datetime as dt
+import os, json, datetime as dt, calendar
 import pandas as pd
 
-REPORTS_DIR = "reports"
-DL = "datalake"
+RDIR = "reports"
 
-def _safe_read(path: str) -> pd.DataFrame:
+def _load_csv(p): 
     try:
-        return pd.read_csv(path)
-    except Exception:
-        return pd.DataFrame()
+        if os.path.exists(p): return pd.read_csv(p)
+    except Exception: pass
+    return pd.DataFrame()
 
-def build_periodic() -> str:
-    """
-    Build simple rolling aggregates for daily/weekly/monthly paper logs.
-    Writes CSVs into reports/ and returns a short status string.
-    Safe to run even if logs are missing (creates tiny placeholders).
-    """
-    os.makedirs(REPORTS_DIR, exist_ok=True)
-    eq = _safe_read(os.path.join(DL, "paper_trades.csv"))
-    op = _safe_read(os.path.join(DL, "options_paper.csv"))
-    fu = _safe_read(os.path.join(DL, "futures_paper.csv"))
+def _save(path: str, txt: str):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    open(path, "w").write(txt)
 
-    def _add_day(df: pd.DataFrame, col: str = "Timestamp") -> pd.DataFrame:
-        if df is None or df.empty:
-            return pd.DataFrame()
-        out = df.copy()
-        if col in out.columns:
-            out["Date"] = pd.to_datetime(out[col], errors="coerce").dt.date
-        else:
-            out["Date"] = dt.date.today()
-        return out
+def _period_bounds_week():
+    """Mon..Fri of the week that just ended (run on Saturday)."""
+    today = dt.datetime.utcnow().date()
+    # Go back to Monday
+    start = today - dt.timedelta(days=today.weekday() + 1)  # yesterday (Fri) if Sat
+    # start_of_week = (start - dt.timedelta(days=4)) if today.weekday()==5 else ...
+    # Simpler: last Monday..Friday block
+    # Find last Friday:
+    last_fri = today - dt.timedelta(days=(today.weekday() - 4) % 7 + 1)
+    last_mon = last_fri - dt.timedelta(days=4)
+    return (last_mon, last_fri)
 
-    eqd, opd, fud = _add_day(eq), _add_day(op), _add_day(fu)
+def _period_bounds_month():
+    """First..last trading-ish day of current month (use calendar month)."""
+    today = dt.datetime.utcnow().date()
+    first = dt.date(today.year, today.month, 1)
+    last_dom = calendar.monthrange(today.year, today.month)[1]
+    last = dt.date(today.year, today.month, last_dom)
+    return (first, last)
 
-    # simple counts per day
-    if not eqd.empty:
-        eqd.groupby("Date").size().rename("equity_trades")\
-            .to_csv(os.path.join(REPORTS_DIR, "agg_equity_daily.csv"))
-    if not opd.empty:
-        opd.groupby("Date").size().rename("options_trades")\
-            .to_csv(os.path.join(REPORTS_DIR, "agg_options_daily.csv"))
-    if not fud.empty:
-        fud.groupby("Date").size().rename("futures_trades")\
-            .to_csv(os.path.join(REPORTS_DIR, "agg_futures_daily.csv"))
+def _slice_by_date(df: pd.DataFrame, start: dt.date, end: dt.date) -> pd.DataFrame:
+    if df is None or df.empty: return df
+    for c in ("Timestamp","Date","datetime","timestamp"):
+        if c in df.columns:
+            try:
+                d = pd.to_datetime(df[c]).dt.date
+                return df[(d >= start) & (d <= end)].copy()
+            except Exception:
+                continue
+    return df
 
-    # create a small index file so artifacts always contain something
-    with open(os.path.join(REPORTS_DIR, "periodic_index.txt"), "w") as f:
-        f.write(f"Periodic built at {dt.datetime.utcnow().isoformat()}Z\n")
-        f.write(f"Equity rows: {0 if eq is None else len(eq)}\n")
-        f.write(f"Options rows: {0 if op is None else len(op)}\n")
-        f.write(f"Futures rows: {0 if fu is None else len(fu)}\n")
+def _fmt(df: pd.DataFrame, cols: list[str], title: str) -> str:
+    if df is None or df.empty:
+        return f"\n== {title} ==\n(none)\n"
+    return f"\n== {title} ==\n" + df[cols].to_string(index=False) + "\n"
 
-    return "periodic_ok"
+def build_periodic():
+    os.makedirs(RDIR, exist_ok=True)
+    # load
+    auto_eq = _load_csv("datalake/paper_trades.csv")
+    algo_eq = _load_csv("datalake/algo_paper.csv")
+    opts    = _load_csv("datalake/options_paper.csv")
+    futs    = _load_csv("datalake/futures_paper.csv")
+
+    # WEEKLY (Sat)
+    wmon, wfri = _period_bounds_week()
+    w_auto = _slice_by_date(auto_eq, wmon, wfri)
+    w_algo = _slice_by_date(algo_eq, wmon, wfri)
+    w_opts = _slice_by_date(opts,    wmon, wfri)
+    w_futs = _slice_by_date(futs,    wmon, wfri)
+
+    w_txt = [f"NIFTY500 Pro Pro — WEEKLY God Report  ({wmon}..{wfri})"]
+    w_txt.append(_fmt(w_auto, ["Timestamp","Symbol","Entry","SL","Target","proba","Reason"], "AUTO (Top 5)"))
+    w_txt.append(_fmt(w_algo, ["Timestamp","Symbol","Entry","SL","Target","proba","Reason"], "ALGO Lab"))
+    w_txt.append(_fmt(w_opts, ["Timestamp","Symbol","Leg","Strike","Expiry","EntryPrice","SL","Target","RR","Reason"], "Options (paper)"))
+    w_txt.append(_fmt(w_futs, ["Timestamp","Symbol","Expiry","EntryPrice","SL","Target","Lots","Reason"], "Futures (paper)"))
+    weekly_path = os.path.join(RDIR, "weekly_report.txt")
+    _save(weekly_path, "\n".join(w_txt))
+
+    # MONTHLY (month-end after hours; this runs daily but you’ll read at month-end)
+    mfirst, mlast = _period_bounds_month()
+    m_auto = _slice_by_date(auto_eq, mfirst, mlast)
+    m_algo = _slice_by_date(algo_eq, mfirst, mlast)
+    m_opts = _slice_by_date(opts,    mfirst, mlast)
+    m_futs = _slice_by_date(futs,    mfirst, mlast)
+
+    m_txt = [f"NIFTY500 Pro Pro — MONTHLY God Report  ({mfirst}..{mlast})"]
+    m_txt.append(_fmt(m_auto, ["Timestamp","Symbol","Entry","SL","Target","proba","Reason"], "AUTO (Top 5)"))
+    m_txt.append(_fmt(m_algo, ["Timestamp","Symbol","Entry","SL","Target","proba","Reason"], "ALGO Lab"))
+    m_txt.append(_fmt(m_opts, ["Timestamp","Symbol","Leg","Strike","Expiry","EntryPrice","SL","Target","RR","Reason"], "Options (paper)"))
+    m_txt.append(_fmt(m_futs, ["Timestamp","Symbol","Expiry","EntryPrice","SL","Target","Lots","Reason"], "Futures (paper)"))
+    monthly_path = os.path.join(RDIR, "monthly_report.txt")
+    _save(monthly_path, "\n".join(m_txt))
+
+    return {"weekly": weekly_path, "monthly": monthly_path}
