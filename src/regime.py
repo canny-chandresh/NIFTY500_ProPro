@@ -23,7 +23,6 @@ def _vix_tag():
     return ("VIX_MED", v)
 
 def _gift_bias():
-    """Use GIFT Nifty daily % change as a weak bias (if available)."""
     gdf = _load_csv("datalake/gift_nifty.csv")
     if gdf is None or gdf.empty: return ("GIFT_UNK", None)
     if {"Close","Open"}.issubset(gdf.columns):
@@ -56,8 +55,6 @@ def apply_regime_adjustments() -> dict:
 
     gtag, gval = _gift_bias()
     tags.append(f"{gtag}={'' if gval is None else round(100*gval,2)}%")
-    # nudge only
-    # (you can wire this into selection rules in model_selector if you want a numeric tilt)
 
     ntag, nval = _news_risk()
     tags.append(f"{ntag}={nval}")
