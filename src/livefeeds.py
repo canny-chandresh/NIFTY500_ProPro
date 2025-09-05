@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, datetime as dt
+import os
 from typing import List, Dict
 import pandas as pd
 
@@ -11,7 +11,6 @@ except Exception:
 DL = "datalake"
 PER = os.path.join(DL, "per_symbol")
 
-# ---------- helpers ----------
 def _fix_symbol_token(token: str) -> str:
     t = token.strip()
     if t.endswith("_NS"):  # bootstrap style (e.g., AXISBANK_NS)
@@ -21,7 +20,6 @@ def _fix_symbol_token(token: str) -> str:
     return t
 
 def _load_symbol_universe() -> List[str]:
-    """Infer universe from per_symbol filenames and sector_map; map *_NS → *.NS."""
     syms = set()
     if os.path.isdir(PER):
         for f in os.listdir(PER):
@@ -38,11 +36,8 @@ def _load_symbol_universe() -> List[str]:
             pass
     if not syms:
         syms.update(["RELIANCE.NS","TCS.NS","INFY.NS","^NSEI","^NSEBANK"])
-    # basic filter: keep those that at least *look* like Yahoo tickers
-    out = [s for s in syms if s and isinstance(s, str)]
-    return sorted(set(out))
+    return sorted(set([s for s in syms if s]))
 
-# ---------- equities ----------
 def refresh_equity_data(days: int = 60, interval: str = "1d") -> Dict:
     os.makedirs(DL, exist_ok=True)
     if yf is None:
@@ -100,7 +95,6 @@ def refresh_equity_data(days: int = 60, interval: str = "1d") -> Dict:
 
     return {"equities_source":"yfinance", "rows": int(len(out)), "symbols": int(out['Symbol'].nunique())}
 
-# ---------- india vix ----------
 def refresh_india_vix(days: int = 60) -> Dict:
     os.makedirs(DL, exist_ok=True)
     if yf is None:
@@ -116,12 +110,7 @@ def refresh_india_vix(days: int = 60) -> Dict:
     except Exception:
         return {"vix_source":"none","rows":0}
 
-# ---------- gift nifty ----------
 def refresh_gift_nifty(tickers: List[str], days: int = 5) -> Dict:
-    """
-    Try multiple Yahoo tickers for GIFT Nifty; save datalake/gift_nifty.csv
-    Fallback: leave file absent (regime will ignore).
-    """
     os.makedirs(DL, exist_ok=True)
     if yf is None or not tickers:
         return {"gift_source":"none","rows":0,"ticker":None}
