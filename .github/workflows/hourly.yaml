@@ -1,60 +1,47 @@
 name: Hourly Train & Daily Notify
 
 on:
+  workflow_dispatch: {}
   schedule:
-    - cron: "15 * * * 1-5"     # every weekday at :15
-  workflow_dispatch: {}         # manual "Run workflow" button
+    # PREOPEN primer ~09:05 IST == 03:35 UTC (Mon–Fri)
+    - cron: "35 3 * * 1-5"
+
+    # Hourly during NSE trading hours (roughly 09:15–15:30 IST)
+    # 09:15–15:30 IST == 03:45–10:00 UTC; run at :15 past 04..09 UTC
+    - cron: "15 4-9 * * 1-5"
+
+    # Daily EOD at 17:00 IST == 11:30 UTC
+    - cron: "30 11 * * 1-5"
+
+    # Weekly (Saturday) 17:05 IST == 11:35 UTC
+    - cron: "35 11 * * 6"
+
+    # Month-end checker (runs daily at ~17:10 IST; code gates true month-end)
+    - cron: "40 11 * * *"
 
 jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ---------- Ensure datalake exists (unzip once if needed) ----------
       - name: Ensure datalake exists (unpack once)
         run: |
-          if [ -d "datalake" ]; then
-            echo "datalake/ already present; skipping unzip."
-          else
+          if [ ! -d "datalake" ]; then
             echo "No datalake/ found; unpacking bootstrap ZIP…"
-            if   [ -f "datalake-backfill.zip" ]; then ZIP_NAME="datalake-backfill.zip"
-            elif [ -f "datalake-bootstrap.zip" ]; then ZIP_NAME="datalake-bootstrap.zip"
+            if [ ! -f "datalake-bootstrap.zip" ]; then
+              echo "⚠️ datalake-bootstrap.zip not found. Continuing."
             else
-              echo "❌ Neither datalake-backfill.zip nor datalake-bootstrap.zip in repo root."
-              exit 0
-            fi
-            sudo apt-get update -y >/dev/null 2>&1 || true
-            sudo apt-get install -y unzip jq >/dev/null 2>&1 || true
-            unzip -o "$ZIP_NAME" -d .
-            if [ ! -d "datalake" ]; then
-              if [ -d "NIFTY500_ProPro/datalake" ]; then mv NIFTY500_ProPro/datalake ./ && rm -rf NIFTY500_ProPro; fi
-              if [ -d "datalake-backfill/datalake" ]; then mv datalake-backfill/datalake ./ && rm -rf datalake-backfill; fi
-              if [ -d "datalake-bootstrap/datalake" ]; then mv datalake-bootstrap/datalake ./ && rm -rf datalake-bootstrap; fi
-              mkdir -p datalake
-              [ -f "daily_equity.parquet" ] && mv daily_equity.parquet datalake/
-              [ -f "daily_equity.csv" ]     && mv daily_equity.csv datalake/
-              [ -f "manifest.txt" ]         && mv manifest.txt datalake/
-              [ -f "universe.csv" ]         && mv universe.csv datalake/
-              if [ -d "per_symbol" ]; then mkdir -p datalake/per_symbol && mv per_symbol/* datalake/per_symbol/ || true; fi
+              sudo apt-get update -y >/dev/null 2>&1 || true
+              sudo apt-get install -y unzip >/dev/null 2>&1 || true
+              unzip -o datalake-bootstrap.zip -d .
+              if [ -d "NIFTY500_ProPro/datalake" ]; then
+                mv NIFTY500_ProPro/datalake ./ && rm -rf NIFTY500_ProPro
+              fi
             fi
           fi
-          echo "✅ Final datalake tree:"
-          ls -la datalake || true
-          [ -d datalake/per_symbol ] && (echo "== datalake/per_symbol ==" && ls -la datalake/per_symbol | head -n 40)
-
-      # ---------- Auto-fix any 'from .x import' relative imports ----------
-      - name: One-shot fix — convert ALL relative imports under src/
-        run: |
-          while IFS= read -r -d '' f; do
-            sed -i -E 's/^[[:space:]]*from[[:space:]]+\.\s*([A-Za-z0-9_\.]+)[[:space:]]+import/from \1 import/g' "$f"
-            sed -i -E 's/^[[:space:]]*import[[:space:]]+\.\s*([A-Za-z0-9_\.]+)/import \1/g' "$f"
-          done < <(find src -type f -name "*.py" -print0)
-          grep -Rne '^[[:space:]]*from[[:space:]]+\.' src || echo "✅ no relative 'from .' imports"
-          grep -Rne '^[[:space:]]*import[[:space:]]+\.' src || echo "✅ no relative 'import .' imports"
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -64,146 +51,37 @@ jobs:
       - name: Install deps (non-fatal)
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          pip install yfinance ta requests pandas pyarrow || true
+          pip install pandas yfinance requests || true
 
-      # ---------- Self-Audit (quick) ----------
-      - name: Self-Audit — planned features & wiring
-        env:
-          PYTHONPATH:  ${{ github.workspace }}/src
-        run: |
-          python - <<'PY'
-          import os, sys, json, importlib, glob, datetime as dt
-          sys.path.append("src")
-          out = {"when_utc": dt.datetime.utcnow().isoformat()+"Z"}
-          out["datalake_present"] = os.path.isdir("datalake")
-          out["daily_equity_present"] = os.path.exists("datalake/daily_equity.parquet") or os.path.exists("datalake/daily_equity.csv")
-          out["per_symbol_count"] = len(glob.glob("datalake/per_symbol/*.csv"))
-          errs = {}
-          for m in ["config","pipeline","regime","feature_rules","indicators","options_executor","report_eod","report_periodic","kill_switch","telegram","model_selector"]:
-              try: importlib.import_module(m)
-              except Exception as e: errs[m] = repr(e)
-          out["import_errors"] = errs
-          print("=== SELF-AUDIT JSON ===")
-          print(json.dumps(out, indent=2))
-          PY
-
-      # ---------- Main run ----------
-      - name: Run pipeline (defensive, never fail the job)
+      - name: Run gated jobs (preopen / hourly / EOD / weekly / month-end)
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID:  ${{ secrets.TG_CHAT_ID }}
           PYTHONPATH:  ${{ github.workspace }}/src
         run: |
           python - <<'PY'
-          import sys, traceback
-          from pathlib import Path
-          if Path("src").exists(): sys.path.append("src")
-          def safe(label, fn):
-              print(f">> {label}")
-              try:
-                  fn(); print(f"<< {label} OK")
-              except Exception as e:
-                  print(f"<< {label} ERROR: {e}")
-                  traceback.print_exc()
-          try:
-              from entrypoints import daily_update, eod_task, periodic_reports_task, after_run_housekeeping
-              from pipeline import run_paper_session
-          except Exception as e:
-              print("Import error in main run:", e); traceback.print_exc(); raise SystemExit(0)
-          safe("daily_update()", lambda: daily_update())
-          safe("run_paper_session()", lambda: run_paper_session(top_k=5))
-          safe("eod_task()", lambda: eod_task())
-          safe("periodic_reports_task()", lambda: periodic_reports_task())
-          safe("after_run_housekeeping()", lambda: after_run_housekeeping())
-          raise SystemExit(0)
+          from entrypoints import preopen_primer, hourly_job, eod_task, periodic_reports_task
+          from utils_time import (
+              is_preopen_window_ist, should_send_now_ist,
+              is_weekly_window_ist, is_month_end_after_hours_ist
+          )
+
+          print("== PREOPEN Check ==")
+          if is_preopen_window_ist():
+              preopen_primer()
+
+          print("== HOURLY (might be gated) ==")
+          hourly_job()
+
+          print("== EOD Check ==")
+          if should_send_now_ist(kind="eod"):
+              print(eod_task())
+
+          print("== Weekly Check ==")
+          if is_weekly_window_ist():
+              print(periodic_reports_task())
+
+          print("== Monthly Check ==")
+          if is_month_end_after_hours_ist():
+              print(periodic_reports_task())
           PY
-
-      # ---------- ML HEALTH: quick visibility in logs ----------
-      - name: ML Health — data & training footprint (shell)
-        run: |
-          echo "== models =="
-          ls -la models || true
-          echo "== datalake files (size + mtime) =="
-          ls -lah --time-style=+'%Y-%m-%d %H:%M:%S' datalake || true
-          echo "== first lines of paper_trades.csv =="
-          head -n 10 datalake/paper_trades.csv || true
-          echo "== first lines of options_paper.csv =="
-          head -n 10 datalake/options_paper.csv || true
-          echo "== first lines of futures_paper.csv =="
-          head -n 10 datalake/futures_paper.csv || true
-
-      # ---------- ML HEALTH: structured JSON (also saved to reports/) ----------
-      - name: ML Health — structured status JSON
-        env:
-          PYTHONPATH:  ${{ github.workspace }}/src
-        run: |
-          python - <<'PY'
-          import os, json, pandas as pd, datetime as dt, glob
-          os.makedirs("reports", exist_ok=True)
-
-          def fsize(path): 
-              return os.path.getsize(path) if os.path.exists(path) else None
-          def mtime(path):
-              return dt.datetime.fromtimestamp(os.path.getmtime(path)).isoformat() if os.path.exists(path) else None
-          def head_csv(path, n=3):
-              if not os.path.exists(path): return None
-              try: return pd.read_csv(path).head(n).to_dict(orient="records")
-              except: return "read_error"
-
-          status = {"when_utc": dt.datetime.utcnow().isoformat()+"Z"}
-
-          # Data ingestion signals
-          status["daily_equity_parquet"] = {
-              "exists": os.path.exists("datalake/daily_equity.parquet"),
-              "size": fsize("datalake/daily_equity.parquet"),
-              "mtime": mtime("datalake/daily_equity.parquet"),
-          }
-          status["daily_equity_csv"] = {
-              "exists": os.path.exists("datalake/daily_equity.csv"),
-              "size": fsize("datalake/daily_equity.csv"),
-              "mtime": mtime("datalake/daily_equity.csv"),
-          }
-          status["per_symbol_count"] = len(glob.glob("datalake/per_symbol/*.csv"))
-
-          # Training / logging signals per strategy
-          for name, fp in {
-              "equity_trades": "datalake/paper_trades.csv",
-              "options_trades": "datalake/options_paper.csv",
-              "futures_trades": "datalake/futures_paper.csv",
-          }.items():
-              status[name] = {
-                  "exists": os.path.exists(fp),
-                  "size": fsize(fp),
-                  "mtime": mtime(fp),
-                  "head": head_csv(fp, 3)
-              }
-
-          # Models footprint (anything saved during housekeeping)
-          if os.path.isdir("models"):
-              status["models"] = sorted(os.listdir("models"))
-          else:
-              status["models"] = []
-
-          # Write human & machine-readable copies
-          with open("reports/ml_status.json","w") as f:
-              json.dump(status, f, indent=2)
-          print("=== ML STATUS JSON ===")
-          print(json.dumps(status, indent=2))
-          PY
-
-      # ---------- Publish reports so you can download ----------
-      - name: List reports (sanity)
-        run: |
-          echo "== reports =="
-          ls -la reports || true
-
-      - name: Upload reports artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: reports_bundle
-          path: |
-            reports/**
-            datalake/killswitch_state.csv
-          if-no-files-found: warn
