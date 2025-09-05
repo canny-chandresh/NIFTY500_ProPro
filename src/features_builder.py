@@ -1,23 +1,16 @@
 from __future__ import annotations
-import os, numpy as np, pandas as pd
+import os, pandas as pd, numpy as np
 
 DL_DIR = "datalake"
 
-def _z(x):
-    x = pd.Series(x)
-    return (x - x.rolling(20).mean()) / (x.rolling(20).std() + 1e-9)
+def _z(x): 
+    s = pd.Series(x); return (s - s.rolling(20).mean()) / (s.rolling(20).std() + 1e-9)
 
 def build_hourly_features() -> str:
-    """
-    Reads datalake/hourly_equity.parquet and emits datalake/features_hourly.parquet
-    with engineered features aligned on (Symbol, Datetime).
-    """
     p = os.path.join(DL_DIR,"hourly_equity.parquet")
-    if not os.path.exists(p):
-        return "no_hourly"
+    if not os.path.exists(p): return "no_hourly"
     df = pd.read_parquet(p)
     if df.empty: return "empty"
-
     df = df.rename(columns={"Date":"Datetime"})
     df = df.sort_values(["Symbol","Datetime"]).reset_index(drop=True)
 
@@ -37,7 +30,7 @@ def build_hourly_features() -> str:
     feat = df.groupby("Symbol", group_keys=False).apply(per_symbol)
     feat = feat.dropna().reset_index(drop=True)
 
-    # Join VIX/GIFT/News pulse if available
+    # VIX & GIFT
     try:
         vix = pd.read_parquet(os.path.join(DL_DIR,"vix_daily.parquet"))
         vix = vix.rename(columns={"Date":"Datetime"})[["Datetime","Close"]].rename(columns={"Close":"vix_close"})
@@ -56,7 +49,7 @@ def build_hourly_features() -> str:
     except Exception:
         feat["gift_norm"] = 0.0
 
-    # Optional news sentiment stub (0 if missing)
+    # news sentiment (placeholder)
     if "news_sent_1h" not in feat.columns:
         feat["news_sent_1h"] = 0.0
 
