@@ -1,7 +1,6 @@
 from __future__ import annotations
-import os, time, json, datetime as dt
+import os, json, datetime as dt, re
 from typing import List, Dict
-import re
 import xml.etree.ElementTree as ET
 import urllib.request
 
