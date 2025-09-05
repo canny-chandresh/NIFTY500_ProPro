@@ -1,110 +1,85 @@
 from __future__ import annotations
-import requests, time, datetime as dt
-from typing import Dict, Any
+import datetime as dt
+from typing import Tuple
 import pandas as pd
-from config import CONFIG
 
-NSE_HOME = "https://www.nseindia.com"
-DERIV_QUOTE = "https://www.nseindia.com/api/quote-derivative?symbol={sym}"
+try:
+    from config import CONFIG
+except Exception:
+    CONFIG = {}
 
-_HEADERS = {
-    "user-agent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                   "KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
-    "accept": "application/json, text/plain, */*",
-    "referer": "https://www.nseindia.com",
-    "cache-control": "no-cache",
-    "pragma": "no-cache",
-}
-
-def _nse_session():
-    s = requests.Session(); s.headers.update(_HEADERS)
-    try: s.get(NSE_HOME, timeout=8)
-    except Exception: pass
-    return s
-
-def _normalize(sym: str) -> tuple[str,str]:
-    s = str(sym).upper().replace(".NS","").replace(".BO","").strip()
-    idx = set(CONFIG.get("options",{}).get("indices",["NIFTY","BANKNIFTY","FINNIFTY","MIDCPNIFTY"]))
-    return ("INDEX", s) if s in idx else ("EQUITY", s)
-
-def _fetch(sess, sym: str):
-    url = DERIV_QUOTE.format(sym=sym)
-    for _ in range(2):
-        try:
-            r = sess.get(url, timeout=12)
-            if r.status_code==200 and r.headers.get("content-type","").startswith("application/json"):
-                return r.json()
-        except Exception:
-            pass
-        time.sleep(0.8)
-        try: sess.get(NSE_HOME, timeout=6)
-        except Exception: pass
-    return None
-
-def _nearest(payload) -> dict|None:
+def _now_ist() -> dt.datetime:
     try:
-        md = payload.get("marketDeptOrderBook", {})
-        data = payload.get("derivatives", []) or payload.get("futures", []) or md.get("otherSeries", [])
-        best, best_dt = None, None
-        for ins in data:
-            exp = ins.get("expiryDate"); ltp = ins.get("lastPrice")
-            if not exp or not ltp: continue
-            dtp = dt.datetime.strptime(exp, "%d-%b-%Y").date()
-            if best_dt is None or dtp < best_dt: best_dt, best = dtp, ins
-        return best
+        from utils_time import now_ist
+        return now_ist()
     except Exception:
-        return None
+        return dt.datetime.utcnow() + dt.timedelta(hours=5, minutes=30)
 
-def _levels(ltp: float):
-    return (ltp*0.985, ltp*1.015)
+def _next_month_end_weekday_ist() -> dt.date:
+    n = _now_ist().date()
+    year, month = n.year, n.month
+    import calendar
+    last_dom = calendar.monthrange(year, month)[1]
+    d = dt.date(year, month, last_dom)
+    while d.weekday() > 4:
+        d -= dt.timedelta(days=1)
+    if d < n:
+        nm_year, nm_month = (year + (month == 12), (month % 12) + 1)
+        last_dom = calendar.monthrange(nm_year, nm_month)[1]
+        d = dt.date(nm_year, nm_month, last_dom)
+        while d.weekday() > 4:
+            d -= dt.timedelta(days=1)
+    return d
 
-def _row(sym, typ, exp, ltp, lots, reason):
-    sl, tgt = _levels(float(ltp))
-    return {
-        "Timestamp": dt.datetime.utcnow().isoformat()+"Z",
-        "Symbol": sym, "UnderlyingType": typ, "Exchange":"NSE", "Expiry": exp,
-        "EntryPrice": round(float(ltp),2), "SL": round(sl,2), "Target": round(tgt,2),
-        "Lots": int(lots), "Reason": reason
-    }
+def _apply_fut_sl(entry: float, sl: float) -> float:
+    mx = float(CONFIG.get("futures", {}).get("max_sl_pct", 0.25))
+    floor = entry * (1.0 - mx)
+    return max(sl, floor)
 
-def _fallback(sym, typ, ref, lots, reason):
-    entry = float(ref or 100.0); sl, tgt = _levels(entry)
-    return {
-        "Timestamp": dt.datetime.utcnow().isoformat()+"Z",
-        "Symbol": sym, "UnderlyingType": typ, "Exchange":"NSE", "Expiry": None,
-        "EntryPrice": round(entry,2), "SL": round(sl,2), "Target": round(tgt,2),
-        "Lots": int(lots), "Reason": reason or "synthetic"
-    }
+def simulate_from_equity_recos(
+    equity_rows: pd.DataFrame,
+    max_rows: int = 3
+) -> Tuple[pd.DataFrame, str]:
+    """
+    Map equity selections to simple futures paper orders (synthetic).
+    Returns (df, source_tag) with source_tag='synthetic'.
+    Columns:
+      Timestamp, Symbol, UnderlyingType, Exchange, Expiry,
+      EntryPrice, SL, Target, Lots, Reason
+    """
+    src_tag = "synthetic"
+    cols_needed = {"Symbol", "Entry", "SL", "Target"}
+    if equity_rows is None or equity_rows.empty or not cols_needed.issubset(equity_rows.columns):
+        return pd.DataFrame(columns=[
+            "Timestamp","Symbol","UnderlyingType","Exchange","Expiry",
+            "EntryPrice","SL","Target","Lots","Reason"
+        ]), src_tag
 
-def simulate_from_equity_recos(equity_df: pd.DataFrame):
-    cols = ["Timestamp","Symbol","UnderlyingType","Exchange","Expiry","EntryPrice","SL","Target","Lots","Reason"]
-    if equity_df is None or equity_df.empty:
-        return pd.DataFrame(columns=cols), "synthetic"
+    lots_default = int(CONFIG.get("futures", {}).get("lots_default", 1))
+    rows = []
+    now_iso = _now_ist().isoformat()
+    exp = _next_month_end_weekday_ist()
 
-    cfg = CONFIG.get("futures", {})
-    allow_live = bool(cfg.get("enable_live_nse", True))
-    lots = int(cfg.get("lot_size", 1))
+    for r in equity_rows.head(max_rows).itertuples():
+        sym = str(getattr(r, "Symbol"))
+        entry = float(getattr(r, "Entry", 0) or 0.0)
+        sl    = float(getattr(r, "SL", 0) or 0.0)
+        tgt   = float(getattr(r, "Target", 0) or 0.0)
+        if entry <= 0:
+            continue
+        sl = _apply_fut_sl(entry, sl)
 
-    sess = _nse_session() if allow_live else None
-    out, used_live = [], False
+        rows.append({
+            "Timestamp": now_iso,
+            "Symbol": sym,
+            "UnderlyingType": "INDEX" if any(k in sym.upper() for k in ("NIFTY","BANKNIFTY","FINNIFTY","MIDCPNIFTY")) else "EQUITY",
+            "Exchange": "NSE",
+            "Expiry": str(exp),
+            "EntryPrice": round(entry, 2),
+            "SL": round(sl, 2),
+            "Target": round(tgt, 2),
+            "Lots": lots_default,
+            "Reason": "synthetic FUT mirror of equity levels"
+        })
 
-    for r in equity_df.itertuples():
-        typ, sym = _normalize(str(getattr(r,"Symbol")))
-        reason = f"equity_reco:{getattr(r,'Reason','')}"
-        ref = float(getattr(r,"Entry", 0.0) or 0.0)
-
-        made = False
-        if allow_live and sess is not None:
-            pl = _fetch(sess, sym)
-            ins = _nearest(pl) if pl else None
-            if ins and ins.get("lastPrice"):
-                out.append(_row(sym, typ, ins.get("expiryDate"), float(ins["lastPrice"]), lots, reason))
-                made, used_live = True, True
-        if not made:
-            out.append(_fallback(sym, typ, ref, lots, reason))
-
-    return pd.DataFrame(out, columns=cols), ("nse_live" if used_live else "synthetic")
-
-def train_from_live_futures():
-    # Optional hook; no-op
-    return True
+    return pd.DataFrame(rows), src_tag
