@@ -5,43 +5,40 @@ on:
   schedule:
     # PREOPEN primer ~09:05 IST == 03:35 UTC (Mon–Fri)
     - cron: "35 3 * * 1-5"
-
     # Hourly during NSE trading hours (roughly 09:15–15:30 IST)
     # 09:15–15:30 IST == 03:45–10:00 UTC; run at :15 past 04..09 UTC
     - cron: "15 4-9 * * 1-5"
-
     # Daily EOD at 17:00 IST == 11:30 UTC
     - cron: "30 11 * * 1-5"
-
     # Weekly (Saturday) 17:05 IST == 11:35 UTC
     - cron: "35 11 * * 6"
-
-    # Month-end checker (runs daily at ~17:10 IST; code gates true month-end)
+    # Month-end checker (runs daily ~17:10 IST; code gates true month-end)
     - cron: "40 11 * * *"
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 35
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Ensure datalake exists (unpack once)
+      - name: Ensure datalake exists (unpack once if present)
         run: |
           if [ ! -d "datalake" ]; then
-            echo "No datalake/ found; unpacking bootstrap ZIP…"
-            if [ ! -f "datalake-bootstrap.zip" ]; then
-              echo "⚠️ datalake-bootstrap.zip not found. Continuing."
-            else
+            if [ -f "datalake-bootstrap.zip" ]; then
               sudo apt-get update -y >/dev/null 2>&1 || true
               sudo apt-get install -y unzip >/dev/null 2>&1 || true
               unzip -o datalake-bootstrap.zip -d .
               if [ -d "NIFTY500_ProPro/datalake" ]; then
                 mv NIFTY500_ProPro/datalake ./ && rm -rf NIFTY500_ProPro
               fi
+            else
+              echo "ℹ️ No datalake/ and no datalake-bootstrap.zip; continuing."
             fi
           fi
+          mkdir -p reports
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -51,7 +48,25 @@ jobs:
       - name: Install deps (non-fatal)
         run: |
           python -m pip install --upgrade pip
-          pip install pandas yfinance requests || true
+          pip install pandas yfinance requests lxml || true
+
+      - name: Smoke tests (non-fatal)
+        env:
+          PYTHONPATH: ${{ github.workspace }}/src
+        run: |
+          python - <<'PY'
+          import sys; sys.path.append('src')
+          try:
+              import smoke_tests as s
+          except Exception:
+              # create a tiny inline smoke if file missing
+              import json, datetime as dt
+              print("=== SMOKE JSON ===")
+              print(json.dumps({"when_utc": dt.datetime.utcnow().isoformat()+"Z",
+                                "checks":[{"name":"missing:src/smoke_tests.py","status":"INFO","detail":"not found"}]}, indent=2))
+          else:
+              s.run_smoke()
+          PY
 
       - name: Run gated jobs (preopen / hourly / EOD / weekly / month-end)
         env:
@@ -84,4 +99,97 @@ jobs:
           print("== Monthly Check ==")
           if is_month_end_after_hours_ist():
               print(periodic_reports_task())
+          PY
+
+      # ---------- SHADOW LAB: safe, non-blocking background evaluations ----------
+      - name: Shadow Lab (walk-forward, drift, robust-ML warmup) — non-fatal
+        if: always()    # run even if earlier steps skipped work
+        env:
+          PYTHONPATH:  ${{ github.workspace }}/src
+        run: |
+          python - <<'PY'
+          """
+          This block runs AFTER the main path and NEVER affects live selections.
+          It writes reports into reports/shadow/ for later inspection.
+          Keep it light to stay within free minutes.
+          """
+          import os, json, datetime as dt, sys, traceback
+          sys.path.append("src")
+          os.makedirs("reports/shadow", exist_ok=True)
+          out = {"when_utc": dt.datetime.utcnow().isoformat()+"Z"}
+
+          def safe(label, fn):
+              try:
+                  r = fn()
+                  out[label] = {"status":"OK","info":r}
+              except Exception as e:
+                  out[label] = {"status":"ERR","error":repr(e)}
+                  traceback.print_exc()
+
+          # ---- Walk-forward (lightweight) ----
+          def light_walkforward():
+              # Example: reuse last 60 bars & do expanding k-fold splits per symbol
+              import pandas as pd
+              p = "datalake/daily_equity.csv"
+              if not os.path.exists(p): return "no_data"
+              df = pd.read_csv(p)
+              if df.empty: return "empty"
+              # Only sample a few symbols to limit runtime
+              syms = list(df["Symbol"].dropna().unique())[:10]
+              metrics = {}
+              for s in syms:
+                  d = df[df["Symbol"]==s].tail(120).reset_index(drop=True)
+                  if len(d) < 40: continue
+                  # naive “model”: EMA20>EMA50 → long next day return
+                  d["ret1"] = d["Close"].pct_change().shift(-1)
+                  import numpy as np
+                  ema20 = d["Close"].ewm(span=20, adjust=False).mean()
+                  ema50 = d["Close"].ewm(span=50, adjust=False).mean()
+                  sig = (ema20 > ema50).astype(int)
+                  hit = ((d["ret1"]>0) & (sig==1)).sum()
+                  tot = int((sig==1).sum())
+                  metrics[s] = {"long_signals": tot, "hit": int(hit), "hit_rate": (hit/max(1,tot))}
+              fp = "reports/shadow/walkforward_summary.json"
+              json.dump(metrics, open(fp,"w"), indent=2)
+              return {"symbols": len(metrics), "file": fp}
+
+          # ---- Drift check (very light) ----
+          def light_drift():
+              import pandas as pd
+              p = "datalake/daily_equity.csv"
+              if not os.path.exists(p): return "no_data"
+              df = pd.read_csv(p)
+              if df.empty: return "empty"
+              # compare last-20 vs prior-20 mean returns (rough proxy)
+              df = df.sort_values("Date")
+              df["ret1"] = df.groupby("Symbol")["Close"].pct_change()
+              tail = df.groupby("Symbol").tail(40)
+              res = {}
+              for s, g in tail.groupby("Symbol"):
+                  g = g.dropna(subset=["ret1"])
+                  if len(g) < 25: continue
+                  last20  = g["ret1"].tail(20).mean()
+                  prev20  = g["ret1"].tail(40).head(20).mean()
+                  res[s] = {"last20": float(last20 or 0), "prev20": float(prev20 or 0),
+                            "delta": float((last20 or 0) - (prev20 or 0))}
+              fp = "reports/shadow/drift_snapshot.json"
+              json.dump(res, open(fp,"w"), indent=2)
+              return {"symbols": len(res), "file": fp}
+
+          # ---- Robust-ML warmup (placeholder) ----
+          def robust_warmup():
+              # Hook for heavier models; here we just mark the timestamp.
+              stamp = {"trained_at": dt.datetime.utcnow().isoformat()+"Z",
+                       "note": "placeholder; swap with real training when ready"}
+              fp = "reports/shadow/robust_warmup.json"
+              json.dump(stamp, open(fp,"w"), indent=2)
+              return {"file": fp}
+
+          safe("walkforward", light_walkforward)
+          safe("drift", light_drift)
+          safe("robust_warmup", robust_warmup)
+
+          json.dump(out, open("reports/shadow/_shadow_run.json","w"), indent=2)
+          print("=== SHADOW LAB JSON ===")
+          print(json.dumps(out, indent=2))
           PY
