@@ -1,4 +1,3 @@
-# src/config.py
 """
 Global configuration for NIFTY500 Pro Pro Screener.
 All feature flags, notification windows, and source settings live here.
@@ -7,7 +6,7 @@ All feature flags, notification windows, and source settings live here.
 CONFIG = {
     # ---- Core features ----
     "features": {
-        "regime_v1": True,         # VIX + (optionally breadth/NIFTY) + GIFT + News
+        "regime_v1": True,         # VIX + (optional breadth/NIFTY) + GIFT + News
         "options_sanity": True,    # sanity checks on option strikes/expiries
         "sr_pivots_v1": True,      # S/R, pivots, gap reasoning
         "status_cmd": True,        # /status on Telegram
