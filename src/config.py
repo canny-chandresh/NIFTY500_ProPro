@@ -12,8 +12,9 @@ CONFIG = {
         "status_cmd": True,        # /status on Telegram
         "reports_v1": True,        # EOD + periodic reports
         "killswitch_v1": True,     # hit-rate floor protection
-        "drift_alerts": True,      # feature drift alerts
-        "walkforward_v1": True,    # walk-forward split
+        "drift_alerts": True,      # feature drift alerts (light)
+        "walkforward_v1": True,    # walk-forward (light)
+        "dl_shadow": True,         # Deep Learning shadow training/eval
     },
 
     # ---- Selection rules ----
@@ -48,6 +49,17 @@ CONFIG = {
         "eod_window_min": 15
     },
 
+    # ---- Data freshness & ingestion ----
+    "data": {
+        "symbols_file": "datalake/symbols.csv",   # optional custom symbol list
+        "default_universe": 300,                  # cap symbols for free tier
+        "fetch": {
+            "daily_days": 400,                    # ~2Y (improves DL)
+            "hourly_days": 60,                    # last 60 days for 60m bars
+            "minute_days": 5                      # 1m bars (Yahoo limit ~7d)
+        }
+    },
+
     # ---- Options ----
     "options": {
         "enabled": True,
@@ -65,8 +77,8 @@ CONFIG = {
     # ---- GIFT Nifty (Yahoo tickers tried in order) ----
     "gift_nifty": {
         "enabled": True,
-        "tickers": ["NIFTY", "^NSEI", "NSEI", "GIFTNIFTY", "GIFTNIFTY.NS"],
-        "days": 5
+        "tickers": ["^NSEI","^NSEBANK","NIFTY","NSEI","GIFTNIFTY","GIFTNIFTY.NS"],
+        "days": 10
     },
 
     # ---- News pulse (RSS) ----
@@ -82,6 +94,21 @@ CONFIG = {
         "keywords_negative": ["downgrade","misses","weak","plunge","fall","scam","fraud","default","loss"],
         "lookback_hours": 6,
         "high_risk_threshold": 3
+    },
+
+    # ---- Deep Learning (shadow) ----
+    "dl": {
+        "seq_len": 120,         # last 120 timesteps (hourly)
+        "horizon_h": 5,         # predict 5-hour ahead “up” probability
+        "max_symbols": 300,     # cap for runner time
+        "epochs": 2,            # short shadow training
+        "minutes_cap": 3,       # time box per run (minutes)
+        "ready_thresholds": {
+            "min_symbols": 10,
+            "min_epochs": 2,
+            "hit_rate": 0.55,
+            "brier_max": 0.25
+        }
     }
 }
 
