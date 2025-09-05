@@ -22,7 +22,6 @@ _report_eod    = _try_import("report_eod")
 _report_period = _try_import("report_periodic")
 _live_train    = _try_import("live_train")
 
-# ---------- IO helpers ----------
 def _ensure_reports(): os.makedirs("reports", exist_ok=True)
 def _append_csv(df: pd.DataFrame, path: str):
     if df is None or df.empty: return
@@ -33,7 +32,6 @@ def _append_csv(df: pd.DataFrame, path: str):
         except Exception: pass
     df.to_csv(path, index=False)
 
-# ---------- Dummies ----------
 def _make_dummy_equity(top_k=5):
     return pd.DataFrame([{
         "Timestamp": pd.Timestamp.utcnow().isoformat()+"Z",
@@ -65,7 +63,6 @@ def _force_write_minimum_logs(equity_df, opts_df, futs_df, top_k):
     _append_csv(opts_df,   "datalake/options_paper.csv")
     _append_csv(futs_df,   "datalake/futures_paper.csv")
 
-# ---------- Features ----------
 def _apply_sms(df):
     if df is None or df.empty or _smartmoney is None: return df
     try: sms = _smartmoney.smart_money_today(df["Symbol"].tolist())
@@ -114,7 +111,6 @@ def _regime_tag():
     try: return _regime.apply_regime_adjustments()
     except Exception: return {"regime":"NA","reason":"unavailable"}
 
-# ---------- Derivatives executors ----------
 def _opts_from_equity(rows_for_opts: pd.DataFrame):
     tag, df = "synthetic", pd.DataFrame()
     try:
@@ -154,7 +150,6 @@ def _source_footer(eq_info, opts_source, opts_df, futs_source, futs_df) -> str:
     eq_rows = (eq_info or {}).get("rows",0)
     op_rows = 0 if (opts_df is None or getattr(opts_df,"empty",True)) else len(opts_df)
     fu_rows = 0 if (futs_df is None or getattr(futs_df,"empty",True)) else len(futs_df)
-    # mark equities 'yfinance' as live; any other tag as synthetic-ish
     eq_badge = "LIVE" if str(eq_src).lower()=="yfinance" else f"SYN/{eq_src}"
     return (
         "\n— _Sources_: "
@@ -163,13 +158,11 @@ def _source_footer(eq_info, opts_source, opts_df, futs_source, futs_df) -> str:
         f"Futures: {futs_source} ({fu_rows})"
     )
 
-# ---------- Main ----------
 def run_paper_session(top_k: int = 5) -> pd.DataFrame:
     ts = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
     status = _kill_status()
     regime = _regime_tag()
 
-    # Ensure live equities & try training
     eq_info = {}
     if _live_train is not None:
         try:
@@ -180,7 +173,6 @@ def run_paper_session(top_k: int = 5) -> pd.DataFrame:
         except Exception as e:
             print("live_train step failed:", e)
 
-    # Predictions
     preds, which_full = pd.DataFrame(), "light"
     try:
         if _model_selector and hasattr(_model_selector,"choose_and_predict_full"):
@@ -189,7 +181,6 @@ def run_paper_session(top_k: int = 5) -> pd.DataFrame:
         print("model_selector.choose_and_predict_full error:", e); preds = pd.DataFrame()
     if preds is None: preds = pd.DataFrame()
 
-    # Tilt + caps
     preds = _apply_sms(preds)
     top = pd.DataFrame()
     if not preds.empty:
@@ -198,7 +189,6 @@ def run_paper_session(top_k: int = 5) -> pd.DataFrame:
         top = _sector_cap(preds, top_k=top_k)
         top = _enrich_reasons(top)
 
-    # Derivatives
     rows_for_derivs = top if not top.empty else preds.head(top_k)
     opts_df, opts_source = _opts_from_equity(rows_for_derivs)
     futs_df, futs_source = _futs_from_equity(rows_for_derivs)
@@ -207,11 +197,9 @@ def run_paper_session(top_k: int = 5) -> pd.DataFrame:
         "futures":{"futures_source":futs_source,"rows":0 if futs_df is None else len(futs_df)},
     })
 
-    # Logs
     _force_write_minimum_logs(top, opts_df, futs_df, top_k)
     footer = _source_footer(eq_info, opts_source, opts_df, futs_source, futs_df)
 
-    # Telegram
     if status=="SUSPENDED" and CONFIG.get("features",{}).get("killswitch_v1",False):
         text = (
             f"*Top {top_k} — SUSPENDED by Kill-Switch*  ({ts})\n"
@@ -233,7 +221,6 @@ def run_paper_session(top_k: int = 5) -> pd.DataFrame:
                 f"{i}. *{r.Symbol}*  Buy {entry:.2f}  SL {sl:.2f}  Tgt {tgt:.2f}  "
                 f"Prob {prob:.2f}  SMS {sms:.2f}\n    _{rsn}_"
             )
-
         if opts_df is not None and not opts_df.empty:
             lines += ["", "*Options (paper)*"]
             for rr in opts_df.head(3).itertuples():
@@ -242,7 +229,6 @@ def run_paper_session(top_k: int = 5) -> pd.DataFrame:
                     f"{getattr(rr,'Strike','')} {getattr(rr,'Expiry','')}  "
                     f"Entry {getattr(rr,'EntryPrice',0):.2f}  RR {(getattr(rr,'RR',0) or 0):.2f}"
                 )
-
         if futs_df is not None and not futs_df.empty:
             lines += ["", "*Futures (paper)*"]
             for rr in futs_df.head(3).itertuples():
@@ -250,7 +236,6 @@ def run_paper_session(top_k: int = 5) -> pd.DataFrame:
                     f"- {getattr(rr,'Symbol','?')} {getattr(rr,'Expiry','')}  "
                     f"Entry {getattr(rr,'EntryPrice',0):.2f}  SL {getattr(rr,'SL',0):.2f}  Tgt {getattr(rr,'Target',0):.2f}"
                 )
-
         text = "\n".join(lines) + footer
 
     _ensure_reports(); open("reports/telegram_sample.txt","w").write(text)
