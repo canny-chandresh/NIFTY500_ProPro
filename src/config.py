@@ -1,106 +1,80 @@
-"""
-Global configuration for NIFTY500 Pro Pro Screener.
-"""
+# src/config.py
+from __future__ import annotations
 
 CONFIG = {
-    # ---- Core features ----
+    # ---- Feature flags (already used across your repo) ----
     "features": {
         "regime_v1": True,
-        "options_sanity": True,
         "sr_pivots_v1": True,
+        "options_sanity": True,
         "status_cmd": True,
         "reports_v1": True,
-        "killswitch_v1": True,     # (tabular) kill-switch
+        "killswitch_v1": True,
         "drift_alerts": True,
         "walkforward_v1": True,
-        "dl_shadow": True,         # Deep Learning: train/eval in shadow
     },
 
-    # ---- Selection rules ----
-    "selection": {"sector_cap_enabled": True, "max_per_sector": 2, "max_total": 5},
+    # ---- Selection / caps ----
+    "selection": {
+        "sector_cap_enabled": True,
+        "max_per_sector": 2,
+        "max_total": 5,
+        "force_top5": False,           # keep False for safety
+        "min_backfill_proba": 0.50,
+    },
 
-    # ---- Modes ----
+    # ---- Modes (how many picks each engine aims for) ----
     "modes": {
-        "auto_enabled": True,      # AUTO = curated 5 → messaged + paper
-        "algo_lab_enabled": True,  # ALGO = broad exploratory paper trades
         "auto_top_k": 5,
-        "algo_max_trades": 30
+        "algo_top_k": 10,              # ALGO explores more candidates
     },
 
-    # ---- Smart money ----
-    "smart_money": {"proba_boost": 0.05, "min_sms": 0.45},
+    # ---- Paper trading cost model (bps round trip) ----
+    "paper_costs": {
+        "equity_bps": 3.0,
+        "options_bps": 30.0,
+        "futures_bps": 5.0,
+    },
 
-    # ---- Notifications (IST) ----
+    # ---- Notifications (Telegram windows, IST) ----
     "notify": {
         "send_only_at_ist": True,
-        "ist_send_hour": 15, "ist_send_min": 15, "window_min": 3,
-        "ist_eod_hour": 17, "ist_eod_min": 0, "eod_window_min": 15
+        "ist_send_hour": 15,
+        "ist_send_min": 15,
+        "window_min": 3,
+        "ist_eod_hour": 17,
+        "ist_eod_min": 0,
+        "eod_window_min": 10,
     },
 
-    # ---- Data freshness & ingestion ----
-    "data": {
-        "symbols_file": "datalake/symbols.csv",
-        "default_universe": 300,
-        "fetch": {
-            "daily_days": 400,      # ~2y
-            "hourly_days": 60,      # 60d 60m
-            "minute_days": 5        # last ~5-7d 1m
-        },
-        "hygiene": {
-            "utc_enforce": True,
-            "dedupe": True,
-            "sort_keys": ["Symbol","Datetime"],
-            "gap_flag": True,         # mark missing bars
-            "volume_zero_fill": True, # fill missing minute bars with Vol=0
-            "outlier_cap_z": 8.0      # soft cap for absurd OHLC/Vol spikes
-        }
-    },
-
-    # ---- Options / Futures ----
-    "options": {"enabled": True, "min_rr": 1.5, "max_sl_pct": 0.25},
-    "futures": {"enabled": True, "lots_default": 1, "max_sl_pct": 0.25},
-
-    # ---- GIFT Nifty & VIX ----
-    "gift_nifty": {"enabled": True, "tickers": ["^NSEI","^NSEBANK","GIFTNIFTY","NIFTY","NSEI"], "days": 10},
-
-    # ---- News pulse (RSS) ----
-    "news": {
+    # ---- Options runtime cfg (placeholder; keep as-is) ----
+    "options": {
         "enabled": True,
-        "feeds": [
-            "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms",
-            "https://www.moneycontrol.com/rss/marketreports.xml",
-            "https://www.livemint.com/rss/markets",
-            "https://www.business-standard.com/rss/markets-106.rss"
-        ],
-        "keywords_positive": ["upgrade","beats","strong","surge","rally","grow","record","profit"],
-        "keywords_negative": ["downgrade","misses","weak","plunge","fall","scam","fraud","default","loss"],
-        "lookback_hours": 6,
-        "high_risk_threshold": 3
+        "min_iv": 0.0,
+        "max_spread_pct": 2.0
     },
 
-    # ---- Deep Learning (shadow) ----
-    "dl": {
-        "seq_len": 120,         # 120 hourly steps
-        "horizon_h": 5,         # 5-hour forward label
-        "max_symbols": 300,
-        "epochs": 2,
-        "minutes_cap": 3,       # time-box each run (minutes)
-        "ready_thresholds": {   # activation gates
-            "min_symbols": 10,
-            "min_epochs": 2,
-            "hit_rate": 0.55,
-            "brier_max": 0.25
+    # ---- Live trading toggles (SAFE DEFAULTS) ----
+    "live": {
+        "dry_run": True,               # hard safety: never place real orders if True
+        "enable_auto_live": False,     # AUTO live? (False by default)
+        "enable_algo_live": False,     # allow ALGO to ever go live (False by default)
+        "conditional_algo_live": True, # AI can *request* ALGO live if True (still respects enable_algo_live)
+        "broker": {
+            "provider": "zerodha",     # or "stub"
+            "api_key": "",
+            "api_secret": "",
+            "user_id": "",
+            "access_token": "",        # leave blank until you wire broker
         },
-        # DL-specific kill-switch
-        "kill_switch": {
-            "window_runs": 6,           # last N eval runs
-            "min_test": 200,            # require N test samples for signal
-            "hit_rate_floor": 0.48,     # suspend if below floor
-            "consec_bad": 3,            # OR if this many bad runs in a row
-            "cooloff_hours": 24         # stay suspended for this long
+        # AI conditions for ALGO live unlock
+        "algo_live_rules": {
+            "auto_wr_min": 0.65,       # need AUTO win-rate >= 65% over window
+            "vix_max": 14.0,           # low volatility
+            "regimes_ok": ["bull", "neutral"],
+            "max_extra_trades": 3,     # how many ALGO trades can be live
+            "per_trade_cap": 0.10,     # 10% of exposure cap per trade
+            "min_proba": 0.54          # require at least this confidence
         }
     }
 }
-
-if __name__ == "__main__":
-    import json; print(json.dumps(CONFIG, indent=2))
