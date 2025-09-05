@@ -1,4 +1,3 @@
-# src/utils_time.py
 from __future__ import annotations
 import datetime as dt
 import calendar
@@ -15,7 +14,7 @@ def is_trading_day_ist(d: dt.date | None = None) -> bool:
 
 def is_trading_hours_ist() -> bool:
     """
-    NSE regular session ~09:15–15:30 IST (we pad slightly).
+    NSE regular session ~09:15–15:30 IST (padded a bit).
     """
     n = now_ist()
     if not is_trading_day_ist(n.date()):
@@ -46,28 +45,30 @@ def should_send_now_ist(kind: str = "reco") -> bool:
     return False
 
 def is_weekly_window_ist() -> bool:
-    """
-    Saturday ~17:05 IST window for weekly summary.
-    """
+    """Saturday ~17:05 IST window for weekly summary."""
     n = now_ist()
-    if n.weekday() != 5:  # Saturday
+    if n.weekday() != 5:
         return False
     return _in_window(n, 17, 5, 20)
 
 def is_month_end_after_hours_ist() -> bool:
     """
-    Month-end (calendar) after hours window (~17:10 IST).
-    If last day is weekend, run on the last trading weekday after hours.
+    Month-end after-hours (~17:10 IST). If month-end is weekend,
+    shift to last weekday.
     """
     n = now_ist()
     year, month = n.year, n.month
     last_dom = calendar.monthrange(year, month)[1]
     last_date = dt.date(year, month, last_dom)
-
-    # If last day on weekend, shift backward to Friday
     while last_date.weekday() > 4:
         last_date -= dt.timedelta(days=1)
-
     if n.date() != last_date:
         return False
     return _in_window(n, 17, 10, 30)
+
+def is_preopen_window_ist() -> bool:
+    """Light primer shortly before open: ~09:00–09:12 IST."""
+    n = now_ist()
+    start = n.replace(hour=9,  minute=0, second=0, microsecond=0)
+    end   = n.replace(hour=9,  minute=12, second=0, microsecond=0)
+    return is_trading_day_ist(n.date()) and (start <= n <= end)
