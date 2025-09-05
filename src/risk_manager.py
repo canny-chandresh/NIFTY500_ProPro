@@ -1,6 +1,8 @@
+# src/risk_manager.py
 from __future__ import annotations
 import os, json
 import pandas as pd
+from config import CONFIG
 
 RISK_STATE = "reports/metrics/risk_state.json"
 
@@ -18,7 +20,7 @@ def apply_guardrails(df: pd.DataFrame) -> pd.DataFrame:
     """
     Enforce hard constraints:
       - daily freeze if drawdown exceeded (paper proxy)
-      - per-trade size cap (20% of budget)
+      - per-trade size cap
     """
     if df is None or df.empty: return df
     s = _read()
@@ -26,8 +28,16 @@ def apply_guardrails(df: pd.DataFrame) -> pd.DataFrame:
         return df.iloc[0:0]  # freeze new trades
 
     d = df.copy()
+    cap = 0.20  # default 20%
+    try:
+        # If ALGO will go live, we may want a tighter cap; policy already sizes, this just hard-clips.
+        rules = CONFIG.get("live", {}).get("algo_live_rules", {})
+        cap = min(cap, float(rules.get("per_trade_cap", 0.10)))
+    except Exception:
+        pass
+
     if "size_pct" in d.columns:
-        d["size_pct"] = d["size_pct"].clip(upper=0.20)  # 20% per trade
+        d["size_pct"] = d["size_pct"].clip(upper=cap)
     return d
 
 def record_day_loss(pct_loss: float):
