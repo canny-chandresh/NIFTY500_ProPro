@@ -6,13 +6,12 @@ on:
     # PREOPEN primer ~09:05 IST == 03:35 UTC (Mon–Fri)
     - cron: "35 3 * * 1-5"
     # Hourly during NSE trading hours (roughly 09:15–15:30 IST)
-    # 09:15–15:30 IST == 03:45–10:00 UTC; run at :15 past 04..09 UTC
     - cron: "15 4-9 * * 1-5"
     # Daily EOD at 17:00 IST == 11:30 UTC
     - cron: "30 11 * * 1-5"
     # Weekly (Saturday) 17:05 IST == 11:35 UTC
     - cron: "35 11 * * 6"
-    # Month-end checker (runs daily ~17:10 IST; code gates true month-end)
+    # Month-end checker daily ~17:10 IST; code gates true month-end
     - cron: "40 11 * * *"
 
 jobs:
@@ -59,7 +58,6 @@ jobs:
           try:
               import smoke_tests as s
           except Exception:
-              # create a tiny inline smoke if file missing
               import json, datetime as dt
               print("=== SMOKE JSON ===")
               print(json.dumps({"when_utc": dt.datetime.utcnow().isoformat()+"Z",
@@ -101,18 +99,13 @@ jobs:
               print(periodic_reports_task())
           PY
 
-      # ---------- SHADOW LAB: safe, non-blocking background evaluations ----------
+      # ---------- SHADOW LAB (writes JSONs to reports/shadow) ----------
       - name: Shadow Lab (walk-forward, drift, robust-ML warmup) — non-fatal
-        if: always()    # run even if earlier steps skipped work
+        if: always()
         env:
           PYTHONPATH:  ${{ github.workspace }}/src
         run: |
           python - <<'PY'
-          """
-          This block runs AFTER the main path and NEVER affects live selections.
-          It writes reports into reports/shadow/ for later inspection.
-          Keep it light to stay within free minutes.
-          """
           import os, json, datetime as dt, sys, traceback
           sys.path.append("src")
           os.makedirs("reports/shadow", exist_ok=True)
@@ -126,41 +119,34 @@ jobs:
                   out[label] = {"status":"ERR","error":repr(e)}
                   traceback.print_exc()
 
-          # ---- Walk-forward (lightweight) ----
           def light_walkforward():
-              # Example: reuse last 60 bars & do expanding k-fold splits per symbol
               import pandas as pd
               p = "datalake/daily_equity.csv"
               if not os.path.exists(p): return "no_data"
               df = pd.read_csv(p)
               if df.empty: return "empty"
-              # Only sample a few symbols to limit runtime
               syms = list(df["Symbol"].dropna().unique())[:10]
               metrics = {}
               for s in syms:
                   d = df[df["Symbol"]==s].tail(120).reset_index(drop=True)
                   if len(d) < 40: continue
-                  # naive “model”: EMA20>EMA50 → long next day return
                   d["ret1"] = d["Close"].pct_change().shift(-1)
-                  import numpy as np
                   ema20 = d["Close"].ewm(span=20, adjust=False).mean()
                   ema50 = d["Close"].ewm(span=50, adjust=False).mean()
                   sig = (ema20 > ema50).astype(int)
                   hit = ((d["ret1"]>0) & (sig==1)).sum()
                   tot = int((sig==1).sum())
-                  metrics[s] = {"long_signals": tot, "hit": int(hit), "hit_rate": (hit/max(1,tot))}
+                  metrics[s] = {"long_signals": tot, "hit": int(hit), "hit_rate": (hit/max(1,tot)) if tot else 0.0}
               fp = "reports/shadow/walkforward_summary.json"
               json.dump(metrics, open(fp,"w"), indent=2)
               return {"symbols": len(metrics), "file": fp}
 
-          # ---- Drift check (very light) ----
           def light_drift():
               import pandas as pd
               p = "datalake/daily_equity.csv"
               if not os.path.exists(p): return "no_data"
               df = pd.read_csv(p)
               if df.empty: return "empty"
-              # compare last-20 vs prior-20 mean returns (rough proxy)
               df = df.sort_values("Date")
               df["ret1"] = df.groupby("Symbol")["Close"].pct_change()
               tail = df.groupby("Symbol").tail(40)
@@ -170,15 +156,13 @@ jobs:
                   if len(g) < 25: continue
                   last20  = g["ret1"].tail(20).mean()
                   prev20  = g["ret1"].tail(40).head(20).mean()
-                  res[s] = {"last20": float(last20 or 0), "prev20": float(prev20 or 0),
-                            "delta": float((last20 or 0) - (prev20 or 0))}
+                  delta   = float((last20 or 0) - (prev20 or 0))
+                  res[s] = {"last20": float(last20 or 0), "prev20": float(prev20 or 0), "delta": delta}
               fp = "reports/shadow/drift_snapshot.json"
               json.dump(res, open(fp,"w"), indent=2)
               return {"symbols": len(res), "file": fp}
 
-          # ---- Robust-ML warmup (placeholder) ----
           def robust_warmup():
-              # Hook for heavier models; here we just mark the timestamp.
               stamp = {"trained_at": dt.datetime.utcnow().isoformat()+"Z",
                        "note": "placeholder; swap with real training when ready"}
               fp = "reports/shadow/robust_warmup.json"
@@ -192,4 +176,61 @@ jobs:
           json.dump(out, open("reports/shadow/_shadow_run.json","w"), indent=2)
           print("=== SHADOW LAB JSON ===")
           print(json.dumps(out, indent=2))
+          PY
+
+      # ---------- Upload Shadow Lab artifacts ----------
+      - name: Upload Shadow artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shadow-lab-${{ github.run_id }}
+          path: |
+            reports/shadow/*.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+      # ---------- Telegram summary for Shadow Lab ----------
+      - name: Telegram Shadow summary (non-fatal)
+        if: always()
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID:  ${{ secrets.TG_CHAT_ID }}
+          PYTHONPATH:  ${{ github.workspace }}/src
+        run: |
+          python - <<'PY'
+          import os, json, sys, datetime as dt
+          sys.path.append("src")
+          def send(msg):
+              try:
+                  import telegram
+                  telegram.send_message(msg)
+              except Exception as e:
+                  print("TG send failed:", e)
+          base = "reports/shadow"
+          wf = os.path.join(base, "walkforward_summary.json")
+          dr = os.path.join(base, "drift_snapshot.json")
+          run = os.path.join(base, "_shadow_run.json")
+          ts = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+          try:
+              wf_avg = "n/a"; wf_syms = 0
+              if os.path.exists(wf):
+                  m = json.load(open(wf))
+                  wf_syms = len(m)
+                  if wf_syms:
+                      wf_avg = sum(v.get("hit_rate",0) for v in m.values())/wf_syms
+                      wf_avg = f"{wf_avg:.2f}"
+              dr_neg = 0; dr_syms = 0
+              if os.path.exists(dr):
+                  d = json.load(open(dr))
+                  dr_syms = len(d)
+                  dr_neg = sum(1 for v in d.values() if v.get("delta",0) < -0.01)
+              msg = (
+                f"*Shadow Lab*: {ts}\n"
+                f"- WF symbols: {wf_syms}, avg hit-rate: {wf_avg}\n"
+                f"- Drift symbols: {dr_syms}, negatives(<-1%): {dr_neg}\n"
+                f"_Artifacts attached in Actions (‘shadow-lab-…’)._\n"
+              )
+              send(msg)
+          except Exception as e:
+              print("Shadow summary failed:", e)
           PY
