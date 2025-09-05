@@ -9,15 +9,16 @@ from livefeeds import refresh_equity_data, refresh_india_vix, refresh_gift_nifty
 from news_pulse import write_pulse_report
 from pipeline import run_paper_session
 
-# Optional reports (safe imports)
+# Reports
 try:
     from report_eod import build_eod
 except Exception:
-    def build_eod(): return "eod_ok"
+    def build_eod(): return {"txt": "reports/eod_report.txt", "html":"reports/eod_report.html"}
+
 try:
     from report_periodic import build_periodic
 except Exception:
-    def build_periodic(): return "periodic_ok"
+    def build_periodic(*args, **kwargs): return {"weekly": None, "monthly": None}
 
 def _merge_sources(extra: dict):
     os.makedirs("reports", exist_ok=True)
@@ -89,25 +90,36 @@ def hourly_job():
     """
     daily_update()
     if is_trading_hours_ist():
-        run_paper_session(top_k=5)
+        run_paper_session(top_k=int(CONFIG.get("modes",{}).get("auto_top_k",5)))
     return "ok"
 
 def eod_task():
     try:
-        if should_send_now_ist(kind="eod"):
-            return build_eod()
-        return build_eod()
+        res = build_eod()
+        # Optional: push a compact digest to Telegram at EOD window
+        try:
+            import telegram
+            msg = (
+                "*EOD God Report ready*\n"
+                f"- TXT: {res.get('txt')}\n"
+                f"- HTML: {res.get('html')}\n"
+                "_Includes: AUTO (5), ALGO Lab (exploratory), Options/Futures paper, Shadow metrics._"
+            )
+            if should_send_now_ist(kind="eod"):
+                telegram.send_message(msg)
+        except Exception:
+            pass
+        return res
     except Exception:
         traceback.print_exc(); return "eod_error"
 
 def periodic_reports_task():
     """
-    Can be called for weekly/monthly; the scheduler decides timing,
-    but calling it outside those windows is harmless.
+    Weekly (Saturday) and Month-end after-hours — handled internally.
     """
     try: return build_periodic()
     except Exception:
-        traceback.print_exc(); return "periodic_error"
+        traceback.print_exc(); return {"weekly": None, "monthly": None}
 
 def after_run_housekeeping():
     return "ok"
