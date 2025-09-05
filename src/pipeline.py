@@ -32,6 +32,16 @@ def _append_csv(df: pd.DataFrame, path: str):
         except Exception: pass
     df.to_csv(path, index=False)
 
+def _append_algo_csv(df: pd.DataFrame, path: str):
+    if df is None or df.empty: return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if os.path.exists(path):
+        try:
+            df = pd.concat([pd.read_csv(path), df], ignore_index=True)
+        except Exception:
+            pass
+    df.to_csv(path, index=False)
+
 def _make_dummy_equity(top_k=5):
     return pd.DataFrame([{
         "Timestamp": pd.Timestamp.utcnow().isoformat()+"Z",
@@ -132,7 +142,7 @@ def _futs_from_equity(rows_for_futs: pd.DataFrame):
     except Exception as e:
         print("futures_executor failed:", e)
     _ensure_reports(); open("reports/futures_source.txt","w").write(tag+"\n")
-    print(f"[FUTURES] source = {tag}, rows = {0 if df is None else len(df)}")
+    print(f"[FUTURES] source = {tag}, rows = {0 if futs_df is None else len(df)}")
     return df, tag
 
 def _merge_sources_used(extra: dict):
@@ -157,6 +167,23 @@ def _source_footer(eq_info, opts_source, opts_df, futs_source, futs_df) -> str:
         f"Options: {opts_source} ({op_rows}) • "
         f"Futures: {futs_source} ({fu_rows})"
     )
+
+def _run_algo_exploratory(preds_all: pd.DataFrame, max_trades: int = 30) -> pd.DataFrame:
+    """
+    ALGO LAB: take a broader slice (beyond AUTO top-k), create paper trades.
+    Uses same levels as equity preds (Entry/SL/Target) but does NOT message Telegram.
+    """
+    if preds_all is None or preds_all.empty:
+        return pd.DataFrame()
+    wide = preds_all.sort_values("proba", ascending=False).head(max_trades + 5)
+    if len(wide) > 5:
+        wide = wide.iloc[5:]
+    if wide.empty:
+        return pd.DataFrame()
+    out = wide.copy()
+    out["Timestamp"] = pd.Timestamp.utcnow().isoformat()+"Z"
+    cols = ["Timestamp","Symbol","Entry","SL","Target","proba","Reason"]
+    return out[cols]
 
 def run_paper_session(top_k: int = 5) -> pd.DataFrame:
     ts = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -186,8 +213,19 @@ def run_paper_session(top_k: int = 5) -> pd.DataFrame:
     if not preds.empty:
         try: preds = preds.sort_values("proba", ascending=False).copy()
         except Exception: pass
+        top = preds.head(top_k)
+        # sector cap if enabled
         top = _sector_cap(preds, top_k=top_k)
         top = _enrich_reasons(top)
+
+    # === ALGO LAB (exploratory paper trades) ===
+    algo_df = pd.DataFrame()
+    if CONFIG.get("modes",{}).get("algo_lab_enabled", True):
+        try:
+            algo_df = _run_algo_exploratory(preds, max_trades=int(CONFIG["modes"].get("algo_max_trades", 30)))
+            _append_algo_csv(algo_df, "datalake/algo_paper.csv")
+        except Exception as e:
+            print("ALGO LAB failed:", e)
 
     rows_for_derivs = top if not top.empty else preds.head(top_k)
     opts_df, opts_source = _opts_from_equity(rows_for_derivs)
