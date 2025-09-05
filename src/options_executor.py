@@ -1,118 +1,160 @@
 from __future__ import annotations
-import time, datetime as dt
-from typing import Dict, Any, List
-import requests
+import math, datetime as dt
+from typing import Tuple, Optional
 import pandas as pd
-from config import CONFIG
 
-NSE_HOME = "https://www.nseindia.com"
-OC_IDX   = "https://www.nseindia.com/api/option-chain-indices?symbol={sym}"
-OC_EQ    = "https://www.nseindia.com/api/option-chain-equities?symbol={sym}"
+try:
+    from config import CONFIG
+except Exception:
+    CONFIG = {}
 
-_HEADERS = {
-    "user-agent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                   "KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
-    "accept": "application/json, text/plain, */*",
-    "referer": "https://www.nseindia.com",
-    "cache-control": "no-cache",
-    "pragma": "no-cache",
-}
+# ---------- Time helpers (IST-aware if utils_time is present) ----------
+def _now_ist() -> dt.datetime:
+    try:
+        from utils_time import now_ist
+        return now_ist()
+    except Exception:
+        return dt.datetime.utcnow() + dt.timedelta(hours=5, minutes=30)
 
-def _nse_session() -> requests.Session:
-    s = requests.Session()
-    s.headers.update(_HEADERS)
-    try: s.get(NSE_HOME, timeout=8)
-    except Exception: pass
-    return s
+def _next_thursday_ist() -> dt.date:
+    """Next Thursday (weekly-style) from 'now' in IST."""
+    n = _now_ist().date()
+    # weekday(): Mon=0 ... Sun=6; Thursday=3
+    days_ahead = (3 - n.weekday()) % 7
+    days_ahead = 7 if days_ahead == 0 else days_ahead  # always next
+    return n + dt.timedelta(days=days_ahead)
 
-def _normalize(sym: str) -> tuple[str, str]:
-    s = str(sym).upper().replace(".NS","").replace(".BO","").strip()
-    idx = set(CONFIG.get("options",{}).get("indices",["NIFTY","BANKNIFTY","FINNIFTY","MIDCPNIFTY"]))
-    return ("INDEX", s) if s in idx else ("EQUITY", s)
+def _next_month_end_weekday_ist() -> dt.date:
+    """Monthly-ish expiry: last weekday (Fri or earlier) of current/next month."""
+    n = _now_ist().date()
+    # Pick this month if still far from month end; else next month
+    year, month = n.year, n.month
+    # final day of month
+    if month == 12:
+        lm_year, lm_month = year, 12
+    else:
+        lm_year, lm_month = year, month
+    import calendar
+    last_dom = calendar.monthrange(lm_year, lm_month)[1]
+    d = dt.date(lm_year, lm_month, last_dom)
+    while d.weekday() > 4:
+        d -= dt.timedelta(days=1)
+    if d < n:  # already passed; take next month
+        nm_year, nm_month = (year + (month == 12), (month % 12) + 1)
+        last_dom = calendar.monthrange(nm_year, nm_month)[1]
+        d = dt.date(nm_year, nm_month, last_dom)
+        while d.weekday() > 4:
+            d -= dt.timedelta(days=1)
+    return d
 
-def _fetch_chain(sess: requests.Session, typ: str, symbol: str) -> Dict[str,Any] | None:
-    url = OC_IDX.format(sym=symbol) if typ == "INDEX" else OC_EQ.format(sym=symbol)
-    for _ in range(2):
-        try:
-            r = sess.get(url, timeout=12)
-            if r.status_code == 200 and r.headers.get("content-type","").startswith("application/json"):
-                return r.json()
-        except Exception:
-            pass
-        time.sleep(0.8)
-        try: sess.get(NSE_HOME, timeout=6)
-        except Exception: pass
-    return None
+# ---------- Heuristics ----------
+_INDEX_HINTS = ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY")
 
-def _snap(symbol: str, typ: str, leg: str, strike: float, exp: str, ltp: float, reason: str) -> dict:
-    sl  = ltp * 0.7
-    tgt = ltp * 1.3
-    rr  = (tgt - ltp) / max(1e-6, (ltp - sl))
-    return {
-        "Timestamp": dt.datetime.utcnow().isoformat()+"Z",
-        "Symbol": symbol, "UnderlyingType": typ, "UnderlyingPrice": None,
-        "Exchange":"NSE","Expiry":exp,"Strike":strike,"Leg":leg,
-        "Qty":1, "EntryPrice":round(ltp,2), "SL":round(sl,2), "Target":round(tgt,2),
-        "RR": round(rr,2), "OI": None, "IV": None, "Reason": reason
-    }
+def _is_index(sym: str) -> bool:
+    s = (sym or "").upper()
+    return any(k in s for k in _INDEX_HINTS)
 
-def _pick_atm_nodes(payload: Dict[str,Any]) -> list[tuple[str,float,float,str]]:
+def _strike_step(underlying: float, is_index: bool) -> int:
+    if is_index:
+        # Rough heuristic
+        if underlying >= 30000:  # BANKNIFTY style
+            return 100
+        return 50               # NIFTY style
+    # Stocks — rough bands
+    if underlying >= 1000: return 10
+    if underlying >= 500:  return 5
+    if underlying >= 200:  return 2
+    return 1
+
+def _round_to_step(x: float, step: int) -> float:
+    return round(step * round(float(x) / step), 2)
+
+def _choose_expiry(sym: str) -> dt.date:
+    return _next_thursday_ist() if _is_index(sym) else _next_month_end_weekday_ist()
+
+def _synthetic_option_price(underlying: float, atm: bool = True) -> float:
+    """
+    Synthetic placeholder, no live NSE data:
+    ATM premium ~ 2% of spot; OTM would be lower. Adjust as needed.
+    """
+    base = max(1.0, 0.02 * float(underlying))
+    return round(base, 2)
+
+def _apply_sanity_sl(entry_price: float, sl_price: float) -> float:
+    mx = float(CONFIG.get("options", {}).get("max_sl_pct", 0.25))
+    # ensure SL no more than mx below entry for long options
+    floor = entry_price * (1.0 - mx)
+    return max(sl_price, floor)
+
+# ---------- Public API ----------
+def simulate_from_equity_recos(
+    equity_rows: pd.DataFrame,
+    max_legs: int = 3
+) -> Tuple[pd.DataFrame, str]:
+    """
+    Map equity picks to simple single-leg options (synthetic).
+    Returns (df, source_tag) with source_tag='synthetic'.
+    Columns produced:
+      Timestamp, Symbol, UnderlyingType, UnderlyingPrice, Exchange, Expiry,
+      Strike, Leg, Qty, EntryPrice, SL, Target, RR, OI, IV, Reason
+    """
+    src_tag = "synthetic"
+    cols_needed = {"Symbol", "Entry", "SL", "Target"}
+    if equity_rows is None or equity_rows.empty or not cols_needed.issubset(equity_rows.columns):
+        return pd.DataFrame(columns=[
+            "Timestamp","Symbol","UnderlyingType","UnderlyingPrice","Exchange","Expiry",
+            "Strike","Leg","Qty","EntryPrice","SL","Target","RR","OI","IV","Reason"
+        ]), src_tag
+
     out = []
-    if not payload or "records" not in payload: return out
-    rec = payload["records"]
-    data = rec.get("data") or []
-    uv  = rec.get("underlyingValue") or 0.0
+    now_iso = _now_ist().isoformat()
+    for r in equity_rows.head(max_legs).itertuples():
+        sym = str(getattr(r, "Symbol"))
+        entry = float(getattr(r, "Entry", 0) or 0.0)
+        sl    = float(getattr(r, "SL", 0) or 0.0)
+        tgt   = float(getattr(r, "Target", 0) or 0.0)
+        if entry <= 0: 
+            continue
 
-    # nearest strike ± one step
-    uniq = sorted(list({r.get("strikePrice") for r in data if r.get("strikePrice") is not None}))
-    if not uniq: return out
-    nearest = min(uniq, key=lambda x: abs(x - uv))
-    neigh = [nearest]
-    i = uniq.index(nearest)
-    if i-1 >= 0: neigh.append(uniq[i-1])
-    if i+1 < len(uniq): neigh.append(uniq[i+1])
+        idx = _is_index(sym)
+        step = _strike_step(entry, idx)
+        strike = _round_to_step(entry, step)
+        expiry = _choose_expiry(sym)
 
-    expiries = rec.get("expiryDates") or []
-    exp = expiries[0] if expiries else None
-    for row in data:
-        sp = row.get("strikePrice")
-        if sp not in neigh: continue
-        ce = (row.get("CE") or {})
-        pe = (row.get("PE") or {})
-        if exp and ce.get("lastPrice"): out.append((exp, float(sp), float(ce["lastPrice"]), "CE"))
-        if exp and pe.get("lastPrice"): out.append((exp, float(sp), float(pe["lastPrice"]), "PE"))
-    return out[:4]
+        # Pick CE when probability implies bullish bias (use target>entry),
+        # else PE. (You can replace with your model's signed signal.)
+        leg = "CE" if tgt >= entry else "PE"
 
-def simulate_from_equity_recos(equity_df: pd.DataFrame):
-    cols = ["Timestamp","Symbol","UnderlyingType","UnderlyingPrice","Exchange",
-            "Expiry","Strike","Leg","Qty","EntryPrice","SL","Target","RR","OI","IV","Reason"]
-    if equity_df is None or equity_df.empty:
-        return pd.DataFrame(columns=cols), "synthetic"
+        # Synthetic premiums: ATM approx
+        opt_entry = _synthetic_option_price(entry, atm=True)
+        # Risk/target translated crudely via % move
+        up_pct  = (tgt - entry) / entry
+        dn_pct  = max(1e-6, (entry - sl) / entry)
 
-    allow_live = bool(CONFIG.get("options",{}).get("enable_live_nse", True))
-    ban = set(map(str.upper, CONFIG.get("options",{}).get("ban_list", [])))
-    rr_min = float(CONFIG.get("options",{}).get("rr_min", 1.2))
+        # Assume option moves ~ 0.5x of underlying percent move (ATM-ish)
+        tgt_price = opt_entry * (1.0 + 0.5 * up_pct)
+        sl_price  = opt_entry * (1.0 - 0.5 * dn_pct)
+        sl_price  = _apply_sanity_sl(opt_entry, sl_price)
 
-    sess = _nse_session() if allow_live else None
-    rows, used_live = [], False
+        rr = (tgt_price - opt_entry) / max(1e-6, (opt_entry - sl_price))
 
-    for r in equity_df.itertuples():
-        typ, sym = _normalize(getattr(r,"Symbol"))
-        if sym in ban: continue
-        reason = f"equity_reco:{getattr(r,'Reason','')}"
-        if allow_live and sess is not None:
-            payload = _fetch_chain(sess, typ, sym)
-            nodes = _pick_atm_nodes(payload) if payload else []
-            for (exp, strike, ltp, leg) in nodes:
-                row = _snap(sym, typ, leg, strike, exp, ltp, reason)
-                if row["RR"] >= rr_min:
-                    rows.append(row); used_live = True
-        if not rows:
-            rows.append(_snap(sym, typ, "CE", None, None, 5.0, "synthetic"))
+        out.append({
+            "Timestamp": now_iso,
+            "Symbol": sym,
+            "UnderlyingType": "INDEX" if idx else "EQUITY",
+            "UnderlyingPrice": round(entry, 2),
+            "Exchange": "NSE",
+            "Expiry": str(expiry),
+            "Strike": strike,
+            "Leg": leg,
+            "Qty": 1,
+            "EntryPrice": round(opt_entry, 2),
+            "SL": round(sl_price, 2),
+            "Target": round(tgt_price, 2),
+            "RR": round(rr, 2),
+            "OI": None, "IV": None,
+            "Reason": f"synthetic {leg} ATM; step={step}"
+        })
 
-    df = pd.DataFrame(rows, columns=cols)
-    return df, ("nse_live" if used_live else "synthetic")
-
-def train_from_live_chain(): 
-    # Optional hook; no-op
-    return True
+    df = pd.DataFrame(out)
+    return df, src_tag
