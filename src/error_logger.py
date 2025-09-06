@@ -21,18 +21,15 @@ Config via environment variables (all optional):
   ERRORLOG_THREAD_SPIKE=100             # thread spike to fail (default: 100)
   ERRORLOG_CONN_SPIKE=100               # socket spike to fail (default: 100)
 """
-
 from __future__ import annotations
-import os, sys, io, re, json, time, traceback, datetime as dt, platform, subprocess, glob, shutil
+import os, sys, io, re, json, time, traceback, datetime as dt, platform, subprocess, glob
 from contextlib import contextmanager
 
-# Optional diagnostics
 try:
     import psutil
 except Exception:
     psutil = None
 
-# Optional pandas for paper_trades pruning
 try:
     import pandas as pd
 except Exception:
@@ -52,7 +49,6 @@ def _getenv_int(name: str, default: int) -> int:
     try: return int(os.getenv(name, "").strip())
     except Exception: return default
 
-# ---------- Redaction (tokens, emails, Bearer, etc.) ----------
 RE_PATTERNS = [
     (re.compile(r'(ghp_[A-Za-z0-9]{20,})'), '***REDACTED_GH_TOKEN***'),
     (re.compile(r'(?i)(Bearer)\s+([A-Za-z0-9\-\._~\+\/]+=*)'), r'\1 ***REDACTED***'),
@@ -71,7 +67,6 @@ def _utc_stamp() -> str:
     return dt.datetime.utcnow().strftime("%Y%m%d_%H%M%SZ")
 
 def _proc_stats():
-    """Process snapshot (best effort)."""
     out = {"rss_mb": None,"fds": None,"threads": None,"conns": None}
     try:
         if psutil:
@@ -101,7 +96,6 @@ def _env_snapshot():
             snap["packages"][mod] = ver
         except Exception:
             pass
-    # git SHA if available
     try:
         sha = subprocess.check_output(["git","rev-parse","HEAD"], timeout=3).decode().strip()
         snap["git_sha"] = sha
@@ -109,19 +103,16 @@ def _env_snapshot():
         pass
     return snap
 
-# ---------- Optional HTTP probe (counts endpoints safely) ----------
 class _HTTPProbe:
     def __init__(self):
         self.enabled = False
         self.calls = []
         self._orig = None
-
     def _safe_url(self, url: str) -> str:
         try:
             return re.sub(r'\?.*$', '', str(url))
         except Exception:
             return str(url)
-
     def _wrap(self, func):
         def wrapped(session, method, url, *a, **kw):
             try:
@@ -130,7 +121,6 @@ class _HTTPProbe:
                 pass
             return func(session, method, url, *a, **kw)
         return wrapped
-
     def enable(self):
         if self.enabled: return
         try:
@@ -140,7 +130,6 @@ class _HTTPProbe:
             self.enabled = True
         except Exception:
             self.enabled = False
-
     def disable(self):
         if not self.enabled: return
         try:
@@ -151,9 +140,7 @@ class _HTTPProbe:
             pass
         self.enabled = False
 
-# ---------- helpers ----------
 def _rotate_dir(pattern: str, keep: int):
-    """Keep newest N files matching glob pattern; delete older ones."""
     try:
         files = sorted(glob.glob(pattern), key=lambda p: os.path.getmtime(p), reverse=True)
         for old in files[keep:]:
@@ -163,7 +150,6 @@ def _rotate_dir(pattern: str, keep: int):
         pass
 
 def _prune_paper_trades(days: int) -> dict:
-    """Keep last N days of paper_trades.csv (by when_utc ISO)."""
     info = {"pruned": False, "kept_rows": None, "total_rows": None, "error": None}
     if not pd or not os.path.exists(PAPER_TRADES):
         return info
@@ -172,7 +158,6 @@ def _prune_paper_trades(days: int) -> dict:
         info["total_rows"] = len(df)
         if "when_utc" not in df.columns or df.empty:
             return info
-        # parse timestamps
         def _parse(x):
             try: return dt.datetime.fromisoformat(str(x).replace("Z",""))
             except Exception: return None
@@ -189,18 +174,14 @@ def _prune_paper_trades(days: int) -> dict:
         info["error"] = repr(e)
         return info
 
-# ---------- RunLogger ----------
 class RunLogger:
     """
     Captures stdout/stderr, exceptions, phase timings, env snapshot,
     resource deltas, optional HTTP call probe. Writes:
-      - reports/logs/<label>_<run_id>.log (full redacted log + JSON summary)
-      - reports/metrics/run_manifest_<run_id>.json (machine-readable)
-      - reports/metrics/run_history.json (rolling 200)
-    Also:
-      - Rotates old logs/manifests.
-      - Prunes paper_trades to last N days.
-      - Optionally fails run on resource spikes.
+      - reports/logs/<label>_<run_id>.log
+      - reports/metrics/run_manifest_<run_id>.json
+      - reports/metrics/run_history.json (rolling)
+    Also rotates logs/manifests and prunes paper_trades.csv.
     """
     def __init__(self, label: str = "run", run_id: str | None = None, http_probe: bool | None = None):
         self.label = label
@@ -210,14 +191,13 @@ class RunLogger:
         self.started_utc = dt.datetime.utcnow().isoformat()+"Z"
         self.pre_stats = _proc_stats()
         self.env = _env_snapshot()
-        self.phases = []  # list of {"name","t0","t1","secs","error"}
-        self.kv = {}      # custom metrics/fields
+        self.phases = []
+        self.kv = {}
         if http_probe is None:
             http_probe = _getenv_bool("ERRORLOG_HTTP_PROBE", True)
         self.http = _HTTPProbe()
         if http_probe: self.http.enable()
 
-        # retention & fail config
         self.max_logs = _getenv_int("ERRORLOG_MAX_LOGS", 50)
         self.max_manifests = _getenv_int("ERRORLOG_MAX_MANIFESTS", 200)
         self.trade_retention_days = _getenv_int("ERRORLOG_TRADE_RETENTION_DAYS", 90)
@@ -231,7 +211,7 @@ class RunLogger:
         os.makedirs(MET_DIR, exist_ok=True)
         os.makedirs(DL_DIR, exist_ok=True)
 
-    # ---- section timing ----
+    from contextlib import contextmanager
     @contextmanager
     def section(self, name: str, swallow: bool = True):
         t0 = time.time()
@@ -249,7 +229,6 @@ class RunLogger:
             self.phases.append({"name": name, "t0": t0, "t1": t1, "secs": round(t1-t0,3), "error": err})
             self._write(f"=== [SECTION END] {name} ({round(t1-t0,3)}s) ===\n")
 
-    # ---- global capture of stdout/stderr ----
     @contextmanager
     def capture_all(self, section: str | None = None, swallow: bool = True):
         old_out, old_err = sys.stdout, sys.stderr
@@ -266,7 +245,6 @@ class RunLogger:
             self._write(f"=== END [{section or self.label}] ===\n")
             sys.stdout, sys.stderr = old_out, old_err
 
-    # ---- misc helpers ----
     def add_meta(self, **kwargs):
         self.kv.update(kwargs or {})
 
@@ -274,14 +252,10 @@ class RunLogger:
         try: self.buf.write(s)
         except Exception: pass
 
-    # ---- dump files ----
     def dump(self) -> str:
-        # post stats & leak heuristics
         post_stats = _proc_stats()
-        try:
-            self.http.disable()
-        except Exception:
-            pass
+        try: self.http.disable()
+        except Exception: pass
 
         def diff(a, b):
             if a is None or b is None: return None
@@ -311,16 +285,14 @@ class RunLogger:
             "delta": {"rss_mb": drss, "fds": dfds, "threads": dthr, "conns": dcnn},
             "leak_flags": leak_flags,
             "env": self.env,
-            "http_calls": http_calls[:200],  # cap
+            "http_calls": http_calls[:200],
             "meta": self.kv,
         }
 
-        # write manifest json
         manifest_path = os.path.join(MET_DIR, f"run_manifest_{self.run_id}.json")
         with open(manifest_path, "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2)
 
-        # append to run_history
         hist_path = os.path.join(MET_DIR, "run_history.json")
         try:
             hist = json.load(open(hist_path)) if os.path.exists(hist_path) else []
@@ -331,7 +303,6 @@ class RunLogger:
         with open(hist_path, "w", encoding="utf-8") as f:
             json.dump(hist, f, indent=2)
 
-        # write redacted log
         os.makedirs(LOG_DIR, exist_ok=True)
         log_path = os.path.join(LOG_DIR, f"{self.label}_{self.run_id}.log")
         body = _redact(self.buf.getvalue())
@@ -347,7 +318,6 @@ class RunLogger:
                         "traceback": e.get("traceback","")
                     }, indent=2)) + "\n")
 
-        # convenience errors-only file
         if self.errors:
             err_path = os.path.join(LOG_DIR, f"errors_only_{self.run_id}.txt")
             with open(err_path, "w", encoding="utf-8") as f:
@@ -355,17 +325,14 @@ class RunLogger:
                     f.write(f"[{i}] section={e.get('section')} err={e.get('error')}\n")
                     f.write(_redact(e.get("traceback","")) + "\n")
 
-        # rotate logs & manifests
         _rotate_dir(os.path.join(LOG_DIR, "*.log"), self.max_logs)
         _rotate_dir(os.path.join(MET_DIR, "run_manifest_*.json"), self.max_manifests)
 
-        # prune paper_trades
         prune_info = _prune_paper_trades(self.trade_retention_days)
         if prune_info.get("pruned"):
             print(f"[RunLogger] Pruned paper_trades.csv to last {self.trade_retention_days} days "
                   f"({prune_info.get('kept_rows')}/{prune_info.get('total_rows')} rows).")
 
-        # optional hard fail if spikes exceed fail thresholds
         if self.fail_on_spike:
             fail = False; reasons = []
             if drss is not None and drss >= self.mem_spike_mb:
@@ -377,12 +344,9 @@ class RunLogger:
             if dcnn is not None and dcnn >= self.conn_spike:
                 fail = True; reasons.append(f"CONN+{dcnn}>={self.conn_spike}")
             if fail:
-                # Write a small sentinel for workflow triage
                 with open(os.path.join(MET_DIR, "resource_spike_fail.txt"), "w") as f:
                     f.write(" ; ".join(reasons))
-                # Also print to stdout (shows in Actions log)
                 print(f"[RunLogger] Failing run due to resource spikes: {', '.join(reasons)}")
-                # Raise after files flushed
                 raise SystemExit(2)
 
         return log_path
