@@ -7,9 +7,8 @@ from reward_engine import reward_from_stats
 STATE = "reports/metrics/ai_ensemble_state.json"
 DEFAULT_WEIGHTS = {"dl": 0.34, "robust": 0.33, "light": 0.33}
 
-# Exploration strategy
-STRATEGY = "ucb"  # "epsilon" or "ucb"
-EPSILON  = 0.10   # used only if STRATEGY="epsilon"
+STRATEGY = "ucb"   # "epsilon" or "ucb"
+EPSILON  = 0.10    # used if STRATEGY="epsilon"
 
 def _read_state():
     if os.path.exists(STATE):
@@ -32,8 +31,7 @@ def _ucb_choice(w: Dict[str,float], hist: list) -> str:
     for h in hist or []:
         a = h.get("which"); r = float(h.get("reward", 0))
         if a in arms:
-            n = cnt[a]
-            cnt[a] += 1
+            n = cnt[a]; cnt[a] += 1
             avg[a] = (avg[a]*n + r) / (cnt[a])
     t = max(1, sum(cnt.values()))
     ucb = {}
@@ -44,21 +42,17 @@ def _ucb_choice(w: Dict[str,float], hist: list) -> str:
     return max(ucb, key=ucb.get)
 
 def update_weights_from_recent(window_days=10):
-    """
-    Update model weights and attach the realized reward to the *last* chosen arm.
-    Reward is computed from AUTO book performance.
-    """
     st = _read_state()
     metr = summarize_last_n(days=window_days)
     r = reward_from_stats(metr.get("AUTO", {}))
 
-    # Attach reward to last history item (the previous decision)
+    # attach reward to last decision
     hist = st.get("history", [])
     if hist:
         hist[-1]["reward"] = float(r)
         st["history"] = hist
 
-    # Small gradient step on the last-used arm toward its reward
+    # gradient step for last-used arm
     last = hist[-1] if hist else None
     if last and "which" in last:
         which = last["which"]
@@ -71,9 +65,6 @@ def update_weights_from_recent(window_days=10):
     return st
 
 def choose_model() -> Tuple[str, dict]:
-    """
-    Pick one of {'dl','robust','light'} using UCB (or epsilon-greedy if configured).
-    """
     st = _read_state()
     w = _normalize(st.get("weights", DEFAULT_WEIGHTS.copy()))
     hist = st.get("history", [])
