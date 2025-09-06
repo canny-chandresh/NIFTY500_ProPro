@@ -1,236 +1,212 @@
-name: Hourly Train & Daily Notify
+name: Hourly / Daily / Weekly / Monthly
 
 on:
   workflow_dispatch: {}
   schedule:
-    # PREOPEN primer ~09:05 IST == 03:35 UTC (Mon–Fri)
-    - cron: "35 3 * * 1-5"
-    # Hourly during NSE trading hours (roughly 09:15–15:30 IST)
-    - cron: "15 4-9 * * 1-5"
-    # Daily EOD at 17:00 IST == 11:30 UTC
-    - cron: "30 11 * * 1-5"
-    # Weekly (Saturday) 17:05 IST == 11:35 UTC
-    - cron: "35 11 * * 6"
-    # Month-end checker daily ~17:10 IST; code gates true month-end
-    - cron: "40 11 * * *"
+    # Run every 30 minutes on weekdays (Mon-Fri). We'll self-gate by IST time in code.
+    - cron: "*/30 * * * 1-5"
+    # Saturday weekly window around 12:30 IST (07:00 UTC). We'll self-gate for weekly.
+    - cron: "0 7 * * 6"
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 45
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Ensure datalake exists (unpack once if present)
+      - name: Show tree (sanity)
         run: |
-          if [ ! -d "datalake" ]; then
-            if [ -f "datalake-bootstrap.zip" ]; then
-              sudo apt-get update -y >/dev/null 2>&1 || true
-              sudo apt-get install -y unzip >/dev/null 2>&1 || true
-              unzip -o datalake-bootstrap.zip -d .
-              if [ -d "NIFTY500_ProPro/datalake" ]; then
-                mv NIFTY500_ProPro/datalake ./ && rm -rf NIFTY500_ProPro
-              fi
-            else
-              echo "ℹ️ No datalake/ and no datalake-bootstrap.zip; continuing."
-            fi
-          fi
-          mkdir -p reports
+          echo "== repo root ==" && ls -la
+          echo "== src ==" && ls -la src || true
+          echo "== workflows ==" && ls -la .github/workflows || true
+          echo "== datalake ==" && ls -la datalake || true
+          echo "== reports ==" && ls -la reports || true
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install deps (non-fatal)
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas yfinance requests lxml || true
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          # extras we rely on
+          pip install pandas pyarrow yfinance ta graphviz || true
 
-      - name: Smoke tests (non-fatal)
-        env:
-          PYTHONPATH: ${{ github.workspace }}/src
+      - name: Ensure datalake exists (optional bootstrap unzip)
         run: |
-          python - <<'PY'
-          import sys; sys.path.append('src')
-          try:
-              import smoke_tests as s
-          except Exception:
-              import json, datetime as dt
-              print("=== SMOKE JSON ===")
-              print(json.dumps({"when_utc": dt.datetime.utcnow().isoformat()+"Z",
-                                "checks":[{"name":"missing:src/smoke_tests.py","status":"INFO","detail":"not found"}]}, indent=2))
-          else:
-              s.run_smoke()
-          PY
+          if [ ! -d "datalake" ]; then
+            echo "No datalake/ present."
+            if [ -f "datalake-bootstrap.zip" ]; then
+              echo "Unzipping datalake-bootstrap.zip …"
+              sudo apt-get update -y >/dev/null 2>&1 || true
+              sudo apt-get install -y unzip >/dev/null 2>&1 || true
+              unzip -o datalake-bootstrap.zip -d . || true
+              # If zipped inside a folder, flatten:
+              if [ -d "NIFTY500_ProPro/datalake" ]; then
+                mv NIFTY500_ProPro/datalake ./ && rm -rf NIFTY500_ProPro
+              fi
+            else
+              echo "No bootstrap zip; proceeding. First runs may fetch/update gradually."
+            fi
+          else
+            echo "datalake/ exists."
+          fi
+          mkdir -p reports/metrics reports/html models
 
-      - name: Run gated jobs (preopen / hourly / EOD / weekly / month-end)
+      - name: Main orchestrator (pre-open / intraday / 15:15 / EOD / weekly / monthly)
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID:  ${{ secrets.TG_CHAT_ID }}
-          PYTHONPATH:  ${{ github.workspace }}/src
         run: |
           python - <<'PY'
-          from entrypoints import preopen_primer, hourly_job, eod_task, periodic_reports_task
-          from utils_time import (
-              is_preopen_window_ist, should_send_now_ist,
-              is_weekly_window_ist, is_month_end_after_hours_ist
-          )
+          import os, sys, traceback, json, datetime as dt
+          from zoneinfo import ZoneInfo
 
-          print("== PREOPEN Check ==")
-          if is_preopen_window_ist():
-              preopen_primer()
-
-          print("== HOURLY (might be gated) ==")
-          hourly_job()
-
-          print("== EOD Check ==")
-          if should_send_now_ist(kind="eod"):
-              print(eod_task())
-
-          print("== Weekly Check ==")
-          if is_weekly_window_ist():
-              print(periodic_reports_task())
-
-          print("== Monthly Check ==")
-          if is_month_end_after_hours_ist():
-              print(periodic_reports_task())
-          PY
-
-      # ---------- SHADOW LAB (writes JSONs to reports/shadow) ----------
-      - name: Shadow Lab (walk-forward, drift, robust-ML warmup) — non-fatal
-        if: always()
-        env:
-          PYTHONPATH:  ${{ github.workspace }}/src
-        run: |
-          python - <<'PY'
-          import os, json, datetime as dt, sys, traceback
+          # Import path
           sys.path.append("src")
-          os.makedirs("reports/shadow", exist_ok=True)
-          out = {"when_utc": dt.datetime.utcnow().isoformat()+"Z"}
 
-          def safe(label, fn):
+          # Helpers
+          def now_ist():
+              return dt.datetime.now(ZoneInfo("Asia/Kolkata"))
+
+          def is_weekend_ist(t: dt.datetime):
+              # Saturday=5, Sunday=6
+              return t.weekday() >= 5
+
+          # Gating windows (IST)
+          t = now_ist()
+          hhmm = t.strftime("%H:%M")
+          dow = t.weekday()  # 0=Mon, 6=Sun
+          is_bday = (dow <= 4)  # Mon-Fri; (holiday logic can be added via src/holidays.py if you have it)
+
+          # Flags
+          do_preopen = is_bday and ("08:30" <= hhmm <= "09:10")
+          do_intraday = is_bday and ("09:30" <= hhmm <= "15:15")
+          do_315 = is_bday and (hhmm >= "15:15" and hhmm <= "15:20")
+          do_eod = is_bday and (hhmm >= "17:00" and hhmm <= "17:10")
+          do_weekly = (dow == 5) and ("12:15" <= hhmm <= "12:45")  # Saturday ~12:30 IST
+          # Month-end check: if tomorrow month != today month and after 17:00 IST
+          tomorrow = t + dt.timedelta(days=1)
+          is_month_end = (t.month != tomorrow.month)
+          do_monthly = is_month_end and (hhmm >= "17:00" and hhmm <= "17:30")
+
+          print(f"[IST] Now={t.isoformat()}  hh:mm={hhmm}  DoW={dow}")
+          print(json.dumps({
+              "preopen": do_preopen, "intraday": do_intraday, "at_3_15": do_315,
+              "eod": do_eod, "weekly": do_weekly, "monthly": do_monthly
+          }, indent=2))
+
+          # Import modules defensively
+          try:
+              from entrypoints import daily_update, eod_task, periodic_reports_task, after_run_housekeeping
+          except Exception as e:
+              print("Entry import error:", e)
+              traceback.print_exc()
+              daily_update = eod_task = periodic_reports_task = after_run_housekeeping = None
+
+          # Pre-open warm-up: capture GIFT, VIX, news pulse, update regime
+          if do_preopen:
+              print("== PRE-OPEN WARM-UP ==")
               try:
-                  r = fn()
-                  out[label] = {"status":"OK","info":r}
+                  if daily_update:
+                      daily_update(preopen=True)   # your function can ignore kw if not defined
               except Exception as e:
-                  out[label] = {"status":"ERR","error":repr(e)}
-                  traceback.print_exc()
+                  print("preopen error:", e); traceback.print_exc()
 
-          def light_walkforward():
-              import pandas as pd
-              p = "datalake/daily_equity.csv"
-              if not os.path.exists(p): return "no_data"
-              df = pd.read_csv(p)
-              if df.empty: return "empty"
-              syms = list(df["Symbol"].dropna().unique())[:10]
-              metrics = {}
-              for s in syms:
-                  d = df[df["Symbol"]==s].tail(120).reset_index(drop=True)
-                  if len(d) < 40: continue
-                  d["ret1"] = d["Close"].pct_change().shift(-1)
-                  ema20 = d["Close"].ewm(span=20, adjust=False).mean()
-                  ema50 = d["Close"].ewm(span=50, adjust=False).mean()
-                  sig = (ema20 > ema50).astype(int)
-                  hit = ((d["ret1"]>0) & (sig==1)).sum()
-                  tot = int((sig==1).sum())
-                  metrics[s] = {"long_signals": tot, "hit": int(hit), "hit_rate": (hit/max(1,tot)) if tot else 0.0}
-              fp = "reports/shadow/walkforward_summary.json"
-              json.dump(metrics, open(fp,"w"), indent=2)
-              return {"symbols": len(metrics), "file": fp}
+          # Intraday hourly: run AI (AUTO + conditional ALGO)
+          if do_intraday or do_315:
+              print("== INTRADAY / AI ==")
+              try:
+                  from pipeline_ai import run_auto_and_algo_sessions
+                  a,b = run_auto_and_algo_sessions()
+                  print(f"AUTO orders: {a}, ALGO orders: {b}")
+              except Exception as e:
+                  print("pipeline_ai error:", e); traceback.print_exc()
+              # After each intraday block, run housekeeping (drift checks, etc.)
+              try:
+                  if after_run_housekeeping:
+                      after_run_housekeeping()
+              except Exception as e:
+                  print("housekeeping error:", e); traceback.print_exc()
 
-          def light_drift():
-              import pandas as pd
-              p = "datalake/daily_equity.csv"
-              if not os.path.exists(p): return "no_data"
-              df = pd.read_csv(p)
-              if df.empty: return "empty"
-              df = df.sort_values("Date")
-              df["ret1"] = df.groupby("Symbol")["Close"].pct_change()
-              tail = df.groupby("Symbol").tail(40)
-              res = {}
-              for s, g in tail.groupby("Symbol"):
-                  g = g.dropna(subset=["ret1"])
-                  if len(g) < 25: continue
-                  last20  = g["ret1"].tail(20).mean()
-                  prev20  = g["ret1"].tail(40).head(20).mean()
-                  delta   = float((last20 or 0) - (prev20 or 0))
-                  res[s] = {"last20": float(last20 or 0), "prev20": float(prev20 or 0), "delta": delta}
-              fp = "reports/shadow/drift_snapshot.json"
-              json.dump(res, open(fp,"w"), indent=2)
-              return {"symbols": len(res), "file": fp}
+          # 3:15 picks: the same intraday block above already runs at this time;
+          # your Telegram 3:15 send is handled inside your reporting/notify functions.
+          # If you prefer an explicit ensure-send hook, you can add one here.
 
-          def robust_warmup():
-              stamp = {"trained_at": dt.datetime.utcnow().isoformat()+"Z",
-                       "note": "placeholder; swap with real training when ready"}
-              fp = "reports/shadow/robust_warmup.json"
-              json.dump(stamp, open(fp,"w"), indent=2)
-              return {"file": fp}
+          # EOD compile (5:00 PM IST): send reports and refresh metrics
+          if do_eod:
+              print("== EOD TASKS ==")
+              try:
+                  if eod_task:
+                      eod_task()
+              except Exception as e:
+                  print("eod_task error:", e); traceback.print_exc()
+              try:
+                  if periodic_reports_task:
+                      periodic_reports_task()  # may roll daily aggregates
+              except Exception as e:
+                  print("periodic_reports_task error:", e); traceback.print_exc()
+              try:
+                  if after_run_housekeeping:
+                      after_run_housekeeping()
+              except Exception as e:
+                  print("housekeeping(EOD) error:", e); traceback.print_exc()
 
-          safe("walkforward", light_walkforward)
-          safe("drift", light_drift)
-          safe("robust_warmup", robust_warmup)
+          # Weekly (Saturday) roll-up
+          if do_weekly:
+              print("== WEEKLY REPORT ==")
+              try:
+                  if periodic_reports_task:
+                      periodic_reports_task(kind="weekly")
+              except Exception as e:
+                  print("weekly error:", e); traceback.print_exc()
 
-          json.dump(out, open("reports/shadow/_shadow_run.json","w"), indent=2)
-          print("=== SHADOW LAB JSON ===")
-          print(json.dumps(out, indent=2))
+          # Month-end roll-up
+          if do_monthly:
+              print("== MONTHLY REPORT ==")
+              try:
+                  if periodic_reports_task:
+                      periodic_reports_task(kind="monthly")
+              except Exception as e:
+                  print("monthly error:", e); traceback.print_exc()
+
+          # Always: print AI status to logs for visibility
+          try:
+              from status_probe import print_status
+              print_status()
+          except Exception:
+              pass
+
+          # Optional: Telegram alert if AI is suspended
+          try:
+              from alerts import alert_if_suspended
+              alert_if_suspended()
+          except Exception:
+              pass
+
+          # Never hard-fail the job; we want schedules to continue even if one block errs
           PY
 
-      # ---------- Upload Shadow Lab artifacts ----------
-      - name: Upload Shadow artifacts
+      - name: Bundle reports (if any) as artifact
+        if: always()
+        run: |
+          mkdir -p out_bundle
+          # common report outputs — adjust paths if your repo differs
+          cp -r reports out_bundle/reports || true
+          cp -r datalake out_bundle/datalake_snapshot || true
+          tar -czf reports_bundle.tgz -C out_bundle .
+          echo "Bundle created: reports_bundle.tgz"
+          ls -la reports_bundle.tgz || true
+
+      - name: Upload artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: shadow-lab-${{ github.run_id }}
-          path: |
-            reports/shadow/*.json
+          name: reports_bundle
+          path: reports_bundle.tgz
           if-no-files-found: ignore
-          retention-days: 7
-
-      # ---------- Telegram summary for Shadow Lab ----------
-      - name: Telegram Shadow summary (non-fatal)
-        if: always()
-        env:
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID:  ${{ secrets.TG_CHAT_ID }}
-          PYTHONPATH:  ${{ github.workspace }}/src
-        run: |
-          python - <<'PY'
-          import os, json, sys, datetime as dt
-          sys.path.append("src")
-          def send(msg):
-              try:
-                  import telegram
-                  telegram.send_message(msg)
-              except Exception as e:
-                  print("TG send failed:", e)
-          base = "reports/shadow"
-          wf = os.path.join(base, "walkforward_summary.json")
-          dr = os.path.join(base, "drift_snapshot.json")
-          run = os.path.join(base, "_shadow_run.json")
-          ts = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-          try:
-              wf_avg = "n/a"; wf_syms = 0
-              if os.path.exists(wf):
-                  m = json.load(open(wf))
-                  wf_syms = len(m)
-                  if wf_syms:
-                      wf_avg = sum(v.get("hit_rate",0) for v in m.values())/wf_syms
-                      wf_avg = f"{wf_avg:.2f}"
-              dr_neg = 0; dr_syms = 0
-              if os.path.exists(dr):
-                  d = json.load(open(dr))
-                  dr_syms = len(d)
-                  dr_neg = sum(1 for v in d.values() if v.get("delta",0) < -0.01)
-              msg = (
-                f"*Shadow Lab*: {ts}\n"
-                f"- WF symbols: {wf_syms}, avg hit-rate: {wf_avg}\n"
-                f"- Drift symbols: {dr_syms}, negatives(<-1%): {dr_neg}\n"
-                f"_Artifacts attached in Actions (‘shadow-lab-…’)._\n"
-              )
-              send(msg)
-          except Exception as e:
-              print("Shadow summary failed:", e)
-          PY
