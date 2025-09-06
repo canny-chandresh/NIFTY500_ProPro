@@ -1,83 +1,67 @@
+# src/entrypoints.py
 from __future__ import annotations
-import os, json, traceback
-from config import CONFIG
-from utils_time import is_trading_hours_ist
+import os, json, datetime as dt
 
-# Live feeds
-from livefeeds import (
-    refresh_equity_minute, refresh_equity_hourly, refresh_equity_daily,
-    refresh_india_vix, refresh_gift_nifty
-)
-from data_quality import run_data_hygiene
-from features_builder import build_hourly_features
-from labels_builder import build_hourly_labels
+from pipeline_ai import run_auto_and_algo_sessions
+from metrics_tracker import summarize_last_n
 
-# Reports & pipeline
+# optional telegram
 try:
-    from report_eod import build_eod
+    from telegram import send_text
 except Exception:
-    def build_eod(): return {"txt":"reports/eod_report.txt","html":"reports/eod_report.html"}
+    def send_text(msg: str):
+        print("[TELEGRAM Fallback]\n" + msg)
 
-try:
-    from report_periodic import build_periodic
-except Exception:
-    def build_periodic(): return {"weekly": None, "monthly": None}
+def _stamp():
+    return dt.datetime.utcnow().replace(microsecond=0).isoformat()+"Z"
 
-from pipeline import run_paper_session
-
-def _merge_sources(extra: dict):
-    os.makedirs("reports", exist_ok=True)
-    path = "reports/sources_used.json"
-    data = {}
-    if os.path.exists(path):
-        try: data = json.load(open(path))
-        except Exception: data = {}
-    data.update(extra or {})
-    json.dump(data, open(path, "w"), indent=2)
-
-def daily_update():
-    info = {}
-    # 1m + 60m + 1d
-    try: info["minute"] = refresh_equity_minute()
-    except Exception as e: info["minute"] = {"equities_source": f"error:{type(e).__name__}"}
-    try: info["hourly"] = refresh_equity_hourly()
-    except Exception as e: info["hourly"] = {"equities_source": f"error:{type(e).__name__}"}
-    try: info["daily"]  = refresh_equity_daily()
-    except Exception as e: info["daily"] = {"equities_source": f"error:{type(e).__name__}"}
-
-    # VIX/GIFT
-    try: info["vix"] = refresh_india_vix(days=CONFIG.get("gift_nifty",{}).get("days",10))
-    except Exception as e: info["vix"] = {"vix_source": f"error:{type(e).__name__}"}
-    try:
-        if CONFIG.get("gift_nifty",{}).get("enabled", True):
-            info["gift"] = refresh_gift_nifty(CONFIG["gift_nifty"]["tickers"], CONFIG["gift_nifty"]["days"])
-    except Exception as e: info["gift"] = {"gift_source": f"error:{type(e).__name__}"}
-
-    # Hygiene → Features → Labels
-    try: info["hygiene"] = run_data_hygiene()
-    except Exception as e: info["hygiene_error"] = str(e)
-    try:
-        info["features_hourly"] = build_hourly_features()
-        info["labels_hourly"] = build_hourly_labels(horizons=(1,5,24))
-    except Exception as e: info["features_error"] = str(e)
-
-    _merge_sources(info)
-    return True
-
-def hourly_job():
-    daily_update()
-    if is_trading_hours_ist():
-        run_paper_session(top_k=int(CONFIG["modes"].get("auto_top_k",5)))
-    # DL shadow training still happens in workflow step (so we can time-box it safely)
+def daily_update(preopen: bool=False):
+    """
+    Pre-open: refresh regime/GIFT/VIX/news if your other modules handle it.
+    Here we just log a heartbeat; your existing modules (regime.py, events.py) can be called from here.
+    """
+    note = {"when_utc": _stamp(), "phase": "preopen" if preopen else "daily_update"}
+    os.makedirs("reports/metrics", exist_ok=True)
+    with open("reports/metrics/daily_update.json","w") as f:
+        json.dump(note, f, indent=2)
 
 def eod_task():
-    try: return build_eod()
-    except Exception:
-        traceback.print_exc(); return "eod_error"
+    """
+    End-of-day: finalize reports, send 5pm summary.
+    If you already have report_eod.py, call it here. Otherwise send a compact stats message.
+    """
+    stats = summarize_last_n(days=5)
+    msg = (
+        "🧾 *EOD Summary*\n"
+        f"AUTO → WR: {stats['AUTO']['win_rate']:.2f}, Sharpe: {stats['AUTO']['sharpe']:.2f}\n"
+        f"ALGO → WR: {stats['ALGO']['win_rate']:.2f}, Sharpe: {stats['ALGO']['sharpe']:.2f}\n"
+        "_(proxy using expected returns; wire your realized P&L for precision)_"
+    )
+    try: send_text(msg)
+    except Exception: pass
+    with open("reports/metrics/eod.json","w") as f:
+        json.dump({"when_utc": _stamp(), "stats": stats}, f, indent=2)
 
-def periodic_reports_task():
-    try: return build_periodic()
+def periodic_reports_task(kind: str|None=None):
+    """
+    kind=None → daily aggregate
+    kind='weekly' / 'monthly' → coarser rollups (placeholder; extend as needed)
+    """
+    stats = summarize_last_n(days=30 if kind=="monthly" else 7 if kind=="weekly" else 5)
+    with open(f"reports/metrics/aggregate_{kind or 'daily'}.json","w") as f:
+        json.dump({"when_utc": _stamp(), "kind": kind or "daily", "stats": stats}, f, indent=2)
+    try:
+        if kind == "weekly":
+            send_text("📊 Weekly report rolled up (see artifact).")
+        elif kind == "monthly":
+            send_text("📈 Monthly report rolled up (see artifact).")
     except Exception:
-        traceback.print_exc(); return {"weekly": None, "monthly": None}
+        pass
 
-def after_run_housekeeping(): return "ok"
+def after_run_housekeeping():
+    """
+    Light cleanup or alerts; you can add drift checks etc. here.
+    """
+    hb = {"when_utc": _stamp(), "ok": True}
+    with open("reports/metrics/housekeeping.json","w") as f:
+        json.dump(hb, f, indent=2)
