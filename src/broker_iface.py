@@ -1,4 +1,3 @@
-# src/broker_iface.py
 from __future__ import annotations
 import os, json, datetime as dt
 from typing import Dict, Any
@@ -8,7 +7,7 @@ LOG = "reports/broker_stub.log"
 def place_order(symbol: str, side: str, qty: int, price: float, meta: Dict[str, Any]) -> Dict[str, Any]:
     """
     SAFE STUB. Does not place real orders.
-    Replace with Zerodha Kite connect integration later.
+    Replace with real broker integration later.
     """
     rec = {
         "when_utc": dt.datetime.utcnow().isoformat()+"Z",
