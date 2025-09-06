@@ -1,3 +1,4 @@
+# src/status_probe.py
 from __future__ import annotations
 import os, json
 
@@ -14,6 +15,7 @@ def print_status():
     pol = _read("reports/metrics/ai_policy_log.json", [])
     flg = _read("reports/metrics/algo_live_flag.json", {})
     met = _read("reports/metrics/rolling_metrics.json", {})
+    atr = _read("reports/metrics/atr_tuner_state.json", {})
 
     print("=== AI ENSEMBLE ===")
     print(json.dumps({"weights": st.get("weights"), "last_history": (st.get("history") or [])[-3:]}, indent=2))
@@ -26,6 +28,9 @@ def print_status():
 
     print("=== METRICS (rolling) ===")
     print(json.dumps(met or {}, indent=2))
+
+    print("=== ATR TUNER (multipliers) ===")
+    print(json.dumps(atr or {}, indent=2))
 
 if __name__ == "__main__":
     print_status()
