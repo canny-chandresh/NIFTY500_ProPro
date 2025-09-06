@@ -1,108 +1,90 @@
+# src/metrics_tracker.py
 from __future__ import annotations
 import os, json, datetime as dt
 import pandas as pd
 
-RPT_DIR = "reports/metrics"
-os.makedirs(RPT_DIR, exist_ok=True)
+DL = "datalake"
+MET_DIR = "reports/metrics"
 
-def _load_csv(path: str) -> pd.DataFrame:
-    try:
-        if os.path.exists(path):
-            return pd.read_csv(path)
-    except Exception:
-        pass
-    return pd.DataFrame()
+def _ensure_dirs():
+    os.makedirs(MET_DIR, exist_ok=True)
 
-def _parse_time(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty: return df
-    for c in ("Timestamp","Date","Datetime","time","created_at"):
-        if c in df.columns:
-            df[c] = pd.to_datetime(df[c], errors="coerce", utc=True)
-            break
-    return df
+def _now_utc():
+    return dt.datetime.utcnow().replace(microsecond=0)
 
-def _get_cost_bps():
-    try:
-        from config import CONFIG
-        c = (CONFIG or {}).get("paper_costs", {})
-        return float(c.get("equity_bps", 3.0)), float(c.get("options_bps", 30.0)), float(c.get("futures_bps", 5.0))
-    except Exception:
-        return 3.0, 30.0, 5.0
+def _read_csv(path: str) -> pd.DataFrame:
+    if not os.path.exists(path): return pd.DataFrame()
+    try: return pd.read_csv(path)
+    except Exception: return pd.DataFrame()
 
-def _stats_from_trades(df: pd.DataFrame, entry="Entry", tgt="Target", sl="SL", kind="equity") -> dict:
-    """
-    Compute trades, win_rate, pnl (currency), ret_vol, max_drawdown, sharpe.
-    PnL proxy is based on entry and realized (tp/sl), minus round-trip costs.
-    """
-    if df is None or df.empty:
-        return {"trades": 0, "win_rate": 0.0, "pnl": 0.0, "ret_vol": 0.0, "max_drawdown": 0.0, "sharpe": 0.0}
-
-    eq_bps, opt_bps, fut_bps = _get_cost_bps()
-    cost_bps = {"equity":eq_bps, "options":opt_bps, "futures":fut_bps}.get(kind, eq_bps) / 10000.0
-
-    d = df.copy()
-    for col in (entry, tgt, sl):
-        if col not in d.columns:
-            d[col] = 0.0
-    d[entry] = pd.to_numeric(d[entry], errors="coerce").fillna(0.0)
-    d[tgt]   = pd.to_numeric(d[tgt],   errors="coerce").fillna(d[entry])
-    d[sl]    = pd.to_numeric(d[sl],    errors="coerce").fillna(d[entry])
-
-    # Proxy realized return per trade
-    per_ret = ((d[tgt] - d[entry]).clip(lower=0) + (d[sl] - d[entry]).clip(upper=0)) / d[entry].replace(0, 1)
-    # Round-trip costs
-    per_ret = per_ret - 2.0 * cost_bps
-
-    pnl_proxy = float((per_ret * d[entry]).sum())  # in entry currency units
-    wins = int((d[tgt] > d[entry]).sum())
-    trades = max(1, len(d))
-    wr = wins / trades
-    vol = float(per_ret.std()) if len(per_ret) > 1 else 0.0
-
-    # Max drawdown on cumulative equity curve
-    eq = (1.0 + per_ret.fillna(0)).cumprod()
-    peak = 1.0
-    max_dd = 0.0
-    for v in eq:
-        peak = max(peak, v)
-        max_dd = min(max_dd, (v / peak - 1.0))
-    max_dd = abs(float(max_dd))
-
-    # Simple Sharpe: mean/std per-trade (risk-free ~0)
-    mean_r = float(per_ret.mean()) if len(per_ret) else 0.0
-    sharpe = float(mean_r / vol) if vol > 1e-9 else 0.0
-
-    return {
-        "trades": int(len(d)),
-        "win_rate": float(wr),
-        "pnl": pnl_proxy,
-        "ret_vol": float(abs(vol)),
-        "max_drawdown": float(max_dd),
-        "sharpe": sharpe
-    }
+def _save_json(path: str, obj):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path,"w") as f: json.dump(obj, f, indent=2)
 
 def summarize_last_n(days: int = 10) -> dict:
-    auto = _parse_time(_load_csv("datalake/paper_trades.csv"))
-    algo = _parse_time(_load_csv("datalake/algo_paper.csv"))
-    opts = _parse_time(_load_csv("datalake/options_paper.csv"))
-    futs = _parse_time(_load_csv("datalake/futures_paper.csv"))
+    """
+    Reads paper_trades.csv and paper_fills.csv if present,
+    computes simple win_rate/Sharpe-like and DD proxy for AUTO and ALGO.
+    Expected columns (trades): when_utc, engine, Symbol, fill_price, Target, SL, status
+    For simplicity, we assume each paper trade exits if Close hits TP/SL during the window.
+    If your execution module already writes PnL rows, adapt below to read that instead.
+    """
+    _ensure_dirs()
 
-    since = dt.datetime.utcnow() - dt.timedelta(days=days)
-    def _slice(df):
-        if df is None or df.empty: return df
-        time_col = next((c for c in ("Timestamp","Date","Datetime","time","created_at") if c in df.columns), None)
-        return df[df[time_col] >= since].copy() if time_col else df
+    trades = _read_csv(os.path.join(DL, "paper_trades.csv"))
+    fills  = _read_csv(os.path.join(DL, "paper_fills.csv"))  # optional
 
-    autoN = _slice(auto); algoN = _slice(algo); optsN = _slice(opts); futsN = _slice(futs)
+    # quick filter last N days by timestamp if present
+    since = _now_utc() - dt.timedelta(days=days)
+    def _parse_ts(x):
+        try: return dt.datetime.fromisoformat(str(x).replace("Z",""))
+        except Exception: return None
+    if "when_utc" in trades.columns:
+        trades["__ts"] = trades["when_utc"].map(_parse_ts)
+        trades = trades.dropna(subset=["__ts"])
+        trades = trades[trades["__ts"] >= since]
 
-    out = {
-        "when_utc": dt.datetime.utcnow().isoformat()+"Z",
-        "window_days": days,
-        "AUTO":    _stats_from_trades(autoN, kind="equity"),
-        "ALGO":    _stats_from_trades(algoN, kind="equity"),
-        "OPTIONS": _stats_from_trades(optsN, entry="EntryPrice", tgt="Target", sl="SL", kind="options"),
-        "FUTURES": _stats_from_trades(futsN, entry="EntryPrice", tgt="Target", sl="SL", kind="futures"),
-    }
-    with open(os.path.join(RPT_DIR, "rolling_metrics.json"), "w") as f:
-        json.dump(out, f, indent=2)
+    if trades.empty:
+        out = {"AUTO":{"win_rate":0.0,"sharpe":0.0,"max_drawdown":0.0},
+               "ALGO":{"win_rate":0.0,"sharpe":0.0,"max_drawdown":0.0}}
+        _save_json(os.path.join(MET_DIR,"rolling_metrics.json"), out)
+        return out
+
+    # very rough PnL proxy: assume immediate TP/SL resolution probability by proba
+    # If you have realized exits, replace this with actual PnL aggregation.
+    def _pnl_proxy(row):
+        entry = float(row.get("fill_price", row.get("Entry", 0.0)) or 0.0)
+        tgt   = float(row.get("Target", 0.0) or 0.0)
+        sl    = float(row.get("SL", 0.0) or 0.0)
+        pr    = float(row.get("proba", 0.5) or 0.5)
+        # expected return approx:
+        up = (tgt - entry)/max(1e-9, entry)
+        dn = (entry - sl)/max(1e-9, entry)
+        exp = pr*up - (1.0-pr)*dn
+        return exp
+
+    trades["exp_ret"] = trades.apply(_pnl_proxy, axis=1)
+    auto = trades[trades["engine"]=="AUTO"]["exp_ret"]
+    algo = trades[trades["engine"]=="ALGO"]["exp_ret"]
+
+    def _metrics(series: pd.Series) -> dict:
+        if series is None or series.empty:
+            return {"win_rate":0.0,"sharpe":0.0,"max_drawdown":0.0}
+        # proxy winrate as fraction of positive exp_ret
+        wr = float((series > 0).mean())
+        mu = float(series.mean())
+        sig= float(series.std(ddof=1) if len(series)>1 else 0.0)
+        sharpe = (mu / (sig+1e-9)) * (len(series)**0.5) if sig>0 else (1.0 if mu>0 else -1.0)
+        # drawdown proxy: cumulative sum min vs max
+        eq = series.cumsum()
+        if eq.empty:
+            dd = 0.0
+        else:
+            roll_max = eq.cummax()
+            dd = float(((eq - roll_max).min()) or 0.0)
+            dd = abs(dd)
+        return {"win_rate": round(wr,4), "sharpe": round(sharpe,3), "max_drawdown": round(dd,4)}
+
+    out = {"AUTO": _metrics(auto), "ALGO": _metrics(algo)}
+    _save_json(os.path.join(MET_DIR,"rolling_metrics.json"), out)
     return out
