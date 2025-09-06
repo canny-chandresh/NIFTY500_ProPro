@@ -1,0 +1,6 @@
+# Pre-trade guardrails (editable)
+max_exposure: 1.0          # total portfolio risk fraction
+max_per_name: 0.25         # per-symbol cap
+do_not_trade: []           # list of symbols to block
+block_times:               # HH:MM-HH:MM IST windows to block new entries (optional)
+  - "09:15-09:20"
