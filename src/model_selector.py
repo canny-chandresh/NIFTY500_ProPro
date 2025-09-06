@@ -1,3 +1,4 @@
+# src/model_selector.py
 from __future__ import annotations
 import os
 import pandas as pd
@@ -7,6 +8,64 @@ try:
 except Exception:
     CONFIG = {"selection":{"sector_cap_enabled":False,"max_per_sector":2,"max_total":5},
               "modes":{"auto_top_k":5}}
+
+# ---------------- ATR helpers ----------------
+
+def _read_symbol_ohlc(symbol: str) -> pd.DataFrame:
+    """
+    Reads datalake/per_symbol/<SYMBOL>.csv with columns like:
+    Date, Open, High, Low, Close, Volume
+    Returns UTC-sorted DataFrame or empty.
+    """
+    path = os.path.join("datalake", "per_symbol", f"{symbol.upper()}.csv")
+    if not os.path.exists(path):
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(path)
+        # normalize columns
+        rename = {c.lower(): c for c in df.columns}
+        for need in ["Date","Open","High","Low","Close"]:
+            if need not in df.columns:
+                # try common variants
+                for c in df.columns:
+                    if c.lower() == need.lower():
+                        df = df.rename(columns={c: need})
+        if "Date" in df.columns:
+            df["Date"] = pd.to_datetime(df["Date"], errors="coerce", utc=True)
+            df = df.sort_values("Date").dropna(subset=["Date"])
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+def _atr14_from_df(ohlc: pd.DataFrame) -> float | None:
+    if ohlc is None or ohlc.empty: return None
+    d = ohlc.copy()
+    if not set(["High","Low","Close"]).issubset(d.columns): return None
+    d["prev_close"] = d["Close"].shift(1)
+    tr = pd.concat([
+        (d["High"] - d["Low"]).abs(),
+        (d["High"] - d["prev_close"]).abs(),
+        (d["Low"] - d["prev_close"]).abs()
+    ], axis=1).max(axis=1)
+    atr = tr.rolling(14, min_periods=14).mean().iloc[-1]
+    try:
+        return float(atr)
+    except Exception:
+        return None
+
+def _attach_atr(picks: pd.DataFrame) -> pd.DataFrame:
+    """Add ATR column to picks by reading each symbol's recent OHLC."""
+    if picks is None or picks.empty: return picks
+    d = picks.copy()
+    d["Symbol"] = d["Symbol"].astype(str).str.upper()
+    atrs = {}
+    syms = d["Symbol"].dropna().unique().tolist()
+    for s in syms:
+        atrs[s] = _atr14_from_df(_read_symbol_ohlc(s))
+    d["ATR"] = d["Symbol"].map(atrs)
+    return d
+
+# --------------- sector cap helpers ------------
 
 def _load_sector_map():
     try:
@@ -43,6 +102,8 @@ def _apply_sector_cap(df: pd.DataFrame) -> pd.DataFrame:
     if "Sector" in out.columns: out=out.drop(columns=["Sector"])
     return out
 
+# --------------- normalization helpers ---------
+
 def _normalize_cols(df: pd.DataFrame, reason_tag: str) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(columns=["Symbol","Entry","SL","Target","proba","Reason"])
@@ -65,12 +126,14 @@ def _normalize_cols(df: pd.DataFrame, reason_tag: str) -> pd.DataFrame:
     if "proba" in d.columns: d=d.sort_values("proba",ascending=False,kind="mergesort")
     return d
 
+# --------------- model calls -------------------
+
 def _try_dl(top_k:int):
     try:
         import dl_runner
         df, tag = dl_runner.predict_topk_if_ready(top_k=top_k)
         if df is not None and not df.empty and tag=="dl_ready":
-            df=_normalize_cols(df,"DL-GRU"); df=_apply_sector_cap(df)
+            df=_normalize_cols(df,"DL-GRU"); df=_attach_atr(df); df=_apply_sector_cap(df)
             return df, "dl"
         return pd.DataFrame(), tag
     except Exception:
@@ -81,7 +144,7 @@ def _try_robust(top_k:int):
         from model_robust import predict_today as robust_predict
         df = robust_predict(top_k=top_k)
         if df is None or df.empty: return pd.DataFrame(), "robust_empty"
-        df=_normalize_cols(df,"ROBUST-ML"); df=_apply_sector_cap(df)
+        df=_normalize_cols(df,"ROBUST-ML"); df=_attach_atr(df); df=_apply_sector_cap(df)
         return df.head(top_k), "robust"
     except Exception:
         return pd.DataFrame(), "robust_error"
@@ -91,10 +154,12 @@ def _try_light(top_k:int):
         from model_swing import predict_today
         df = predict_today(top_k=top_k)
         if df is None or df.empty: return pd.DataFrame(), "light_empty"
-        df=_normalize_cols(df,"LIGHT-ML"); df=_apply_sector_cap(df)
+        df=_normalize_cols(df,"LIGHT-ML"); df=_attach_atr(df); df=_apply_sector_cap(df)
         return df.head(top_k), "light"
     except Exception:
         return pd.DataFrame(), "light_error"
+
+# --------------- main chooser ------------------
 
 def choose_and_predict_full(top_k:int=5):
     """
@@ -127,7 +192,6 @@ def choose_and_predict_full(top_k:int=5):
     if raw is None or raw.empty:
         return pd.DataFrame(columns=["Symbol","Entry","SL","Target","proba","Reason"]), "none"
 
-    # Apply AI policy + risk
     try:
         from ai_policy import build_context, apply_policy
         from risk_manager import apply_guardrails
@@ -137,7 +201,7 @@ def choose_and_predict_full(top_k:int=5):
     except Exception:
         pass
 
-    # record which model actually used
+    # Record which model actually used
     try:
         import json, datetime as dt
         p = "reports/metrics/ai_ensemble_state.json"
