@@ -1,4 +1,3 @@
-# src/ai_policy.py
 from __future__ import annotations
 import os, json, datetime as dt
 import pandas as pd
@@ -105,11 +104,11 @@ def _thresholds_by_context(ctx: dict, purpose: str) -> dict:
     if news_risk >= 2:
         thr["min_proba"] += 0.02; thr["exposure_cap"] = min(thr["exposure_cap"], 0.65)
 
-    # Purpose adjustments (ALGO explores but smaller sizing)
+    # Purpose adjustments (ALGO explores smaller sizing)
     if purpose == "algo":
         thr["min_proba"] = max(0.50, thr["min_proba"] - 0.02)
         thr["max_picks"] = min(3, int(CONFIG.get("modes", {}).get("algo_top_k", 10)))
-        thr["exposure_cap"] = min(thr["exposure_cap"], 0.50)  # keep smaller book for explore
+        thr["exposure_cap"] = min(thr["exposure_cap"], 0.50)
 
     thr["min_proba"] = float(max(0.50, min(0.65, thr["min_proba"])))
     thr["sl_pct"]    = float(max(0.006, min(0.02, thr["sl_pct"])))
@@ -169,7 +168,7 @@ def apply_policy(raw_df: pd.DataFrame, ctx: dict) -> pd.DataFrame:
 def decide_algo_live(ctx: dict) -> dict:
     """
     AI gatekeeper for ALGO going live. Writes reports/metrics/algo_live_flag.json
-    and returns the dict {"allowed": bool, "reason": str, "...": ...}
+    and returns {"allowed": bool, "reason": str, ...}
     """
     live_cfg = CONFIG.get("live", {})
     rules = live_cfg.get("algo_live_rules", {})
@@ -184,11 +183,9 @@ def decide_algo_live(ctx: dict) -> dict:
     elif dry_run:
         out["reason"] = "dry_run_true"
     elif not conditional:
-        # if conditional is False but enable_algo_live True, we allow always (still subject to risk caps)
         out["allowed"] = True
         out["reason"] = "conditional_false_allow_all"
     else:
-        # check metrics + context
         try:
             from metrics_tracker import summarize_last_n
             metr = summarize_last_n(days=10)
@@ -207,7 +204,6 @@ def decide_algo_live(ctx: dict) -> dict:
         else:
             out["reason"] = f"conditions_not_met wr={auto_wr:.2f} vix={vix} regime={regime}"
 
-    # persist the flag
     os.makedirs(os.path.dirname(ALGO_FLAG) or ".", exist_ok=True)
     json.dump({**out, "when_utc": dt.datetime.utcnow().isoformat()+"Z"}, open(ALGO_FLAG,"w"), indent=2)
     return out
