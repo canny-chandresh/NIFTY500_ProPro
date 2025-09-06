@@ -220,6 +220,16 @@ def run_auto_and_algo_sessions(top_k_auto: int | None = None, top_k_algo: int | 
             if CONFIG.get("registry",{}).get("enabled", True):
                 register_model({"name":"master_selector", "params":{"context":ctx}, "metrics":{"sample":True}})
 
+        # 8c) Deep Learning shadow training
+with logger.section("dl/shadow_train"):
+    try:
+        from dl_models.master_dl import DeepLearningTrainer
+        dl = DeepLearningTrainer(window_days=90)
+        dl_metrics = dl.train()
+        logger.add_meta(dl=dl_metrics)
+    except Exception as e:
+        print("[dl] error:", e)
+
         # 9) Telegram notify
         with logger.section("telegram/send"):
             header = f"NIFTY500 ProPro — {model_tag.upper()} — {dt.datetime.utcnow().strftime('%Y-%m-%d %H:%MZ')}"
