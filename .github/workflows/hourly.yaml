@@ -1,31 +1,64 @@
-name: Hourly / Daily / Weekly / Monthly
+name: Hourly Train & Reports
 
 on:
-  workflow_dispatch: {}
+  # ── Schedules are in UTC ───────────────────────────────────────────────
   schedule:
-    # Run every 30 minutes on weekdays; code self-gates by IST windows.
-    - cron: "*/30 * * * 1-5"
-    # Saturday weekly window around 12:30 IST (07:00 UTC); code self-gates.
-    - cron: "0 7 * * 6"
+    # Pre-open warmup @ 09:05 IST ≈ 03:35 UTC (Mon–Fri)
+    - cron: "35 3 * * 1-5"
+    # Hourly loop (gated by market_hours in code) — at :15 UTC every hour
+    - cron: "15 * * * 1-5"
+    # EOD summary @ 17:05 IST ≈ 11:35 UTC (Mon–Fri)
+    - cron: "35 11 * * 1-5"
+    # Weekly rollup: Saturday 10:00 IST ≈ 04:30 UTC
+    - cron: "30 4 * * 6"
+    # Month-end rollup: last day 18:00 IST ≈ 12:30 UTC
+    - cron: "30 12 28-31 * *"
+  workflow_dispatch: {}
 
 jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
+    env:
+      # ——— Telegram (must be set in repo secrets) ———
+      TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+      TG_CHAT_ID:  ${{ secrets.TG_CHAT_ID }}
+
+      # ——— Error logger & housekeeping knobs ———
+      ERRORLOG_HTTP_PROBE: "true"
+      ERRORLOG_MAX_LOGS: "60"
+      ERRORLOG_MAX_MANIFESTS: "300"
+      ERRORLOG_TRADE_RETENTION_DAYS: "120"
+      # set to "true" later if you want the job to fail on big resource spikes
+      ERRORLOG_FAIL_ON_SPIKE: "false"
+      ERRORLOG_MEM_SPIKE_MB: "700"
+      ERRORLOG_FD_SPIKE: "100"
+      ERRORLOG_THREAD_SPIKE: "200"
+      ERRORLOG_CONN_SPIKE: "200"
+
+      # ——— Archiver: keep last 24 months active (older → archives/) ———
+      ARCHIVER_RETENTION_MONTHS: "24"
+
+      # Ensure src/ is importable for python -m calls
+      PYTHONPATH: ${{ github.workspace }}/src
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Show tree (sanity)
+      - name: Show repo tree (sanity)
         run: |
-          echo "== repo root ==" && ls -la
-          echo "== src ==" && ls -la src || true
-          echo "== workflows ==" && ls -la .github/workflows || true
-          echo "== datalake ==" && ls -la datalake || true
-          echo "== reports ==" && ls -la reports || true
+          echo "== root =="
+          ls -la
+          echo "== src =="
+          ls -la src || true
+          echo "== datalake =="
+          ls -la datalake || true
+          echo "== reports =="
+          ls -la reports || true
 
-      - name: Setup Python
+      - name: Setup Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -34,160 +67,127 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          # common extras we use; keep non-fatal
-          pip install pandas pyarrow yfinance ta graphviz || true
+          # safety: ensure these are present
+          pip install pandas numpy requests psutil pytest || true
 
-      - name: Ensure datalake exists (optional bootstrap unzip)
-        run: |
-          if [ ! -d "datalake" ]; then
-            echo "No datalake/ present."
-            if [ -f "datalake-bootstrap.zip" ]; then
-              echo "Unzipping datalake-bootstrap.zip …"
-              sudo apt-get update -y >/dev/null 2>&1 || true
-              sudo apt-get install -y unzip >/dev/null 2>&1 || true
-              unzip -o datalake-bootstrap.zip -d . || true
-              # Flatten if nested:
-              if [ -d "NIFTY500_ProPro/datalake" ]; then
-                mv NIFTY500_ProPro/datalake ./ && rm -rf NIFTY500_ProPro
-              fi
-            else
-              echo "No bootstrap zip; proceeding. First runs may fetch/update gradually."
-            fi
-          else
-            echo "datalake/ exists."
-          fi
-          mkdir -p reports/metrics reports/html models
-
-      - name: Orchestrator (pre-open / intraday / 15:15 / EOD / weekly / monthly)
-        env:
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID:  ${{ secrets.TG_CHAT_ID }}
+      # ───────────────────────────────────────────────────────────────────
+      # 0) Pre-open warmup (runs once per day at 09:05 IST via cron)
+      # ───────────────────────────────────────────────────────────────────
+      - name: Pre-open warmup
+        if: github.event.schedule == '35 3 * * 1-5'
         run: |
           python - <<'PY'
-          import os, sys, traceback, json, datetime as dt
-          from zoneinfo import ZoneInfo
-
-          sys.path.append("src")
-
-          # ---------------- time gating helpers ----------------
-          def now_ist(): return dt.datetime.now(ZoneInfo("Asia/Kolkata"))
-          t = now_ist(); hhmm = t.strftime("%H:%M"); dow = t.weekday()  # 0=Mon,6=Sun
-          is_bday = (dow <= 4)  # Mon-Fri (add exchange holiday check in src/holidays.py if you have it)
-
-          do_preopen = is_bday and ("08:30" <= hhmm <= "09:10")
-          do_intraday = is_bday and ("09:30" <= hhmm <= "15:15")
-          do_315 = is_bday and (hhmm >= "15:15" and hhmm <= "15:20")
-          do_eod = is_bday and (hhmm >= "17:00" and hhmm <= "17:10")
-          do_weekly = (dow == 5) and ("12:15" <= hhmm <= "12:45")  # Saturday ~12:30 IST
-          tomorrow = t + dt.timedelta(days=1)
-          is_month_end = (t.month != tomorrow.month)
-          do_monthly = is_month_end and (hhmm >= "17:00" and hhmm <= "17:30")
-
-          print(f"[IST] Now={t.isoformat()}  hh:mm={hhmm}  DoW={dow}")
-          print(json.dumps({
-              "preopen": do_preopen, "intraday": do_intraday, "at_3_15": do_315,
-              "eod": do_eod, "weekly": do_weekly, "monthly": do_monthly
-          }, indent=2))
-
-          # ---------------- imports (defensive) ----------------
-          try:
-              from entrypoints import daily_update, eod_task, periodic_reports_task, after_run_housekeeping
-          except Exception as e:
-              print("Entry import error:", e)
-              traceback.print_exc()
-              daily_update = eod_task = periodic_reports_task = after_run_housekeeping = None
-
-          # ---------------- PRE-OPEN ----------------
-          if do_preopen:
-              print("== PRE-OPEN WARM-UP ==")
-              try:
-                  if daily_update:
-                      daily_update(preopen=True)
-              except Exception as e:
-                  print("preopen error:", e); traceback.print_exc()
-
-          # ---------------- INTRADAY (incl. 15:15 picks) ----------------
-          if do_intraday or do_315:
-              print("== INTRADAY / AI ==")
-              try:
-                  from pipeline_ai import run_auto_and_algo_sessions
-                  a,b = run_auto_and_algo_sessions()
-                  print(f"AUTO orders: {a}, ALGO orders: {b}")
-              except Exception as e:
-                  print("pipeline_ai error:", e); traceback.print_exc()
-
-              # Housekeeping after intraday block
-              try:
-                  if after_run_housekeeping:
-                      after_run_housekeeping()
-              except Exception as e:
-                  print("housekeeping error:", e); traceback.print_exc()
-
-              # Self-tune ATR from rolling metrics (learn every run)
-              try:
-                  from ai_policy import build_context
-                  from atr_tuner import update_from_metrics
-                  ctx = build_context()
-                  update_from_metrics(ctx)
-              except Exception as e:
-                  print("atr_tuner update error:", e)
-
-          # ---------------- EOD (5:00 PM IST) ----------------
-          if do_eod:
-              print("== EOD TASKS ==")
-              try:
-                  if eod_task: eod_task()
-              except Exception as e:
-                  print("eod_task error:", e); traceback.print_exc()
-              try:
-                  if periodic_reports_task: periodic_reports_task()
-              except Exception as e:
-                  print("periodic_reports_task error:", e); traceback.print_exc()
-              try:
-                  if after_run_housekeeping: after_run_housekeeping()
-              except Exception as e:
-                  print("housekeeping(EOD) error:", e); traceback.print_exc()
-
-          # ---------------- WEEKLY (Saturday) ----------------
-          if do_weekly:
-              print("== WEEKLY REPORT ==")
-              try:
-                  if periodic_reports_task: periodic_reports_task(kind="weekly")
-              except Exception as e:
-                  print("weekly error:", e); traceback.print_exc()
-
-          # ---------------- MONTHLY (month-end after hours) ----------------
-          if do_monthly:
-              print("== MONTHLY REPORT ==")
-              try:
-                  if periodic_reports_task: periodic_reports_task(kind="monthly")
-              except Exception as e:
-                  print("monthly error:", e); traceback.print_exc()
-
-          # ---------------- Print status snapshot to logs ----------------
-          try:
-              from status_probe import print_status
-              print_status()
-          except Exception:
-              pass
-
-          # Never hard-fail the job; keep schedules running even on partial errors
+          import sys; sys.path.append("src")
+          from entrypoints import daily_update
+          daily_update(preopen=True)
           PY
 
-      - name: Bundle reports (if any) as artifact
-        if: always()
+      # ───────────────────────────────────────────────────────────────────
+      # 1) Hourly recommendation session (gated in code by market_hours)
+      # ───────────────────────────────────────────────────────────────────
+      - name: Hourly run (gated)
         run: |
-          mkdir -p out_bundle
-          cp -r reports out_bundle/reports || true
-          cp -r datalake out_bundle/datalake_snapshot || true
-          tar -czf reports_bundle.tgz -C out_bundle .
-          echo "Bundle created: reports_bundle.tgz"
-          ls -la reports_bundle.tgz || true
+          python - <<'PY'
+          import sys; sys.path.append("src")
+          from entrypoints import run_paper_session
+          # top_k comes from config inside pipeline; you can override here if needed.
+          run_paper_session(top_k=5)
+          PY
 
-      - name: Upload artifact
+      # ───────────────────────────────────────────────────────────────────
+      # 2) EOD summary + housekeeping (runs once at 17:05 IST via cron)
+      # ───────────────────────────────────────────────────────────────────
+      - name: EOD summary + housekeeping
+        if: github.event.schedule == '35 11 * * 1-5'
+        run: |
+          python - <<'PY'
+          import sys; sys.path.append("src")
+          from entrypoints import eod_task, after_run_housekeeping
+          eod_task()
+          after_run_housekeeping()
+          PY
+
+      # ───────────────────────────────────────────────────────────────────
+      # 3) Weekly / Monthly rollups (triggered by their crons)
+      # ───────────────────────────────────────────────────────────────────
+      - name: Weekly rollup (Sat)
+        if: github.event.schedule == '30 4 * * 6'
+        run: |
+          python - <<'PY'
+          import sys; sys.path.append("src")
+          from entrypoints import periodic_reports_task
+          periodic_reports_task(kind="weekly")
+          PY
+
+      - name: Month-end rollup (last day)
+        # crude month-end check: run on 28–31 but only if tomorrow is a new month
+        if: github.event.schedule == '30 12 28-31 * *'
+        run: |
+          python - <<'PY'
+          import sys, datetime as dt
+          sys.path.append("src")
+          from entrypoints import periodic_reports_task
+          today = dt.datetime.utcnow().date()
+          tomorrow = today + dt.timedelta(days=1)
+          if tomorrow.month != today.month:
+              periodic_reports_task(kind="monthly")
+          else:
+              print("Not month-end, skipping.")
+          PY
+
+      # ───────────────────────────────────────────────────────────────────
+      # 4) Smoke tests (non-fatal so early wiring doesn't block you)
+      # ───────────────────────────────────────────────────────────────────
+      - name: Run smoke tests (pytest)
+        continue-on-error: true
+        run: |
+          if [ -d tests ]; then
+            pytest -q || true
+          else
+            echo "No tests/ directory yet — skipping."
+          fi
+
+      # ───────────────────────────────────────────────────────────────────
+      # 5) Upload artifacts (logs, metrics, backtests, explain, news)
+      # ───────────────────────────────────────────────────────────────────
+      - name: Upload run logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: reports_bundle
-          path: reports_bundle.tgz
+          name: logs_${{ github.run_id }}
+          path: |
+            reports/logs/*.log
+            reports/logs/errors_only_*.txt
           if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload metrics & manifests
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: metrics_${{ github.run_id }}
+          path: |
+            reports/metrics/*.json
+            reports/metrics/*.txt
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload backtests & explain
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: analytics_${{ github.run_id }}
+          path: |
+            reports/backtests/*.json
+            reports/explain/*.json
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload news snapshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: news_${{ github.run_id }}
+          path: datalake/news_sentiment.csv
+          if-no-files-found: ignore
+          retention-days: 7
