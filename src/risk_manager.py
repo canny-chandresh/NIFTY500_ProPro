@@ -1,44 +1,43 @@
+# src/risk_manager.py
 from __future__ import annotations
-import os, json
 import pandas as pd
 from config import CONFIG
 
-RISK_STATE = "reports/metrics/risk_state.json"
-
-def _read():
-    if os.path.exists(RISK_STATE):
-        try: return json.load(open(RISK_STATE))
-        except Exception: pass
-    return {"daily_loss": 0.0, "drawdown_exceeded": False}
-
-def _write(s):
-    os.makedirs(os.path.dirname(RISK_STATE) or ".", exist_ok=True)
-    json.dump(s, open(RISK_STATE, "w"), indent=2)
-
 def apply_guardrails(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty: return df
-    s = _read()
-    if s.get("drawdown_exceeded"):
-        return df.iloc[0:0]  # freeze new trades
+    """
+    Enforce exposure caps, numeric hygiene, and minimum trade size.
+    - assumes columns: Symbol, Entry, Target, SL, proba, size_pct
+    """
+    if df is None or df.empty:
+        return df
 
     d = df.copy()
-    cap = 0.20  # default 20%
-    try:
-        rules = CONFIG.get("live", {}).get("algo_live_rules", {})
-        cap = min(cap, float(rules.get("per_trade_cap", 0.10)))
-    except Exception:
-        pass
+    # Ensure numeric
+    for c in ("Entry","Target","SL","proba","size_pct"):
+        if c in d.columns:
+            d[c] = pd.to_numeric(d[c], errors="coerce")
 
-    if "size_pct" in d.columns:
-        d["size_pct"] = d["size_pct"].clip(upper=cap)
-    return d
+    # remove obviously bad rows
+    d = d.dropna(subset=["Symbol","Entry","Target","SL","proba"])
+    d = d[d["Entry"] > 0]
 
-def record_day_loss(pct_loss: float):
-    s = _read()
-    s["daily_loss"] = float(s.get("daily_loss", 0.0) + pct_loss)
-    if s["daily_loss"] <= -0.03:
-        s["drawdown_exceeded"] = True
-    _write(s)
+    # Cap by exposure
+    cap = float(CONFIG.get("modes",{}).get("exposure_cap_overall", 1.0))
+    if "size_pct" not in d.columns or d["size_pct"].isna().all():
+        # even sizing fallback
+        n = max(1, len(d))
+        d["size_pct"] = round(1.0 / n, 4)
+    tot = d["size_pct"].sum()
+    if tot > 0:
+        d["size_pct"] = (d["size_pct"] / tot) * min(1.0, cap)
 
-def reset_day():
-    _write({"daily_loss": 0.0, "drawdown_exceeded": False})
+    # Avoid tiny dust trades
+    d = d[d["size_pct"] >= 0.02]  # >= 2% of capital
+
+    # Clip absurd TP/SL
+    d["Target"] = d[["Target","Entry"]].max(axis=1)
+    d["SL"] = d[["SL","Entry"]].min(axis=1)
+
+    # Keep only sensible columns
+    keep = [c for c in ["Symbol","Entry","Target","SL","proba","size_pct","Reason","mode"] if c in d.columns]
+    return d[keep].reset_index(drop=True)
