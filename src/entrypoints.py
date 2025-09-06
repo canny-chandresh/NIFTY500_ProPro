@@ -1,10 +1,14 @@
 # src/entrypoints.py
 from __future__ import annotations
 import os, json, datetime as dt
+import pandas as pd
 
 from error_logger import RunLogger
+from locks import RunLock
+from market_hours import should_run_hourly, is_preopen_window, is_eod_window
 from metrics_tracker import summarize_last_n
 from archiver import run_archiver
+from backtester import backtest_trades
 
 # Telegram fallbacks
 try:
@@ -22,6 +26,8 @@ except Exception:
         print("[PIPELINE Fallback] run_auto_and_algo_sessions not available")
         return 0, 0
 
+DL = "datalake"
+
 def _stamp() -> str:
     return dt.datetime.utcnow().replace(microsecond=0).isoformat()+"Z"
 
@@ -29,7 +35,7 @@ def _stamp() -> str:
 
 def daily_update(preopen: bool=False):
     """
-    Lightweight daily prep. If preopen=True (first run before open), it just warms up and pings TG.
+    Lightweight prep. If preopen=True (first run before open), it just warms up and pings TG.
     """
     label = "preopen" if preopen else "daily_update"
     logger = RunLogger(label=label)
@@ -45,34 +51,62 @@ def daily_update(preopen: bool=False):
 
 def run_paper_session(top_k: int = 5):
     """
-    Wrapper for the recommendation pass; emits a log & manifest automatically.
+    Hourly recommendation pass with market-hours gating & idempotency lock.
     """
+    # Gate: only during trading hours (IST) — allow if preopen/eod windows
+    if not (should_run_hourly() or is_preopen_window() or is_eod_window()):
+        print("[gate] Outside trading window; skipping.")
+        return
+
     logger = RunLogger(label="reco_session")
     with logger.capture_all("reco_session", swallow=True):
-        a, b = run_auto_and_algo_sessions(top_k_auto=top_k, top_k_algo=None)
-        send_text(f"✅ Session complete — AUTO:{a} ALGO:{b}")
-        logger.add_meta(auto_count=a, algo_count=b)
+        try:
+            with RunLock("reco_session", ttl_sec=1800):
+                a, b = run_auto_and_algo_sessions(top_k_auto=top_k, top_k_algo=None)
+                send_text(f"✅ Session complete — AUTO:{a} ALGO:{b}")
+                logger.add_meta(auto_count=a, algo_count=b)
+        except RuntimeError as e:
+            print("[lock] another run in progress; skipping:", e)
     logger.dump()
 
 # ----------------- EOD report & housekeeping triggers -----------------
 
 def eod_task():
     """
-    End-of-day summary to Telegram + metrics snapshot.
+    End-of-day: run a quick backtest on paper_trades with slippage, push summary,
+    roll up metrics, and persist heartbeat.
     """
     logger = RunLogger(label="eod")
     with logger.capture_all("eod", swallow=True):
+        # backtest paper trades (if any)
+        bt_summary = {}
+        p = os.path.join(DL, "paper_trades.csv")
+        if os.path.exists(p):
+            try:
+                df = pd.read_csv(p)
+                bt_summary = backtest_trades(df, slippage_bps=5, commission_bps=1)
+                print("[backtest] summary:", bt_summary)
+            except Exception as e:
+                print("[backtest] error:", e)
+
+        # aggregate last 5 days stats
         stats = summarize_last_n(days=5)
-        send_stats(stats, title="🧾 EOD Summary")
+        eod_payload = {"when_utc": _stamp(), "stats": stats, "backtest": bt_summary}
         os.makedirs("reports/metrics", exist_ok=True)
         with open("reports/metrics/eod.json","w", encoding="utf-8") as f:
-            json.dump({"when_utc": _stamp(), "stats": stats}, f, indent=2)
+            json.dump(eod_payload, f, indent=2)
+
+        send_stats(stats, title="🧾 EOD Summary")
+        if bt_summary:
+            send_text(f"🧪 Backtest — trades: {bt_summary.get('trades',0)}, "
+                      f"win%: {bt_summary.get('win_rate')}, "
+                      f"pnl_sum: {round(bt_summary.get('pnl_sum',0.0),4)}")
     logger.dump()
 
 def periodic_reports_task(kind: str|None=None):
     """
     kind: None/'daily' (default), 'weekly', 'monthly'
-    Produces aggregate metrics and pings Telegram with a short note.
+    Produces aggregate metrics and pings Telegram.
     """
     label = f"periodic_{kind or 'daily'}"
     logger = RunLogger(label=label)
@@ -91,14 +125,12 @@ def periodic_reports_task(kind: str|None=None):
 def after_run_housekeeping():
     """
     Post-run cleanup + archiving:
-      - rotates logs/manifests (handled by RunLogger.dump())
-      - prunes paper_trades to last N days (handled by RunLogger.dump())
-      - archives datalake files older than retention (24 months) into archives/YYYY-MM.zip
+      - rotations & pruning handled by RunLogger.dump()
+      - archive datalake files older than 24 months → archives/YYYY-MM.zip
     """
     logger = RunLogger(label="housekeeping")
     with logger.capture_all("housekeeping", swallow=True):
         info = run_archiver(retention_months=24, dry_run=False)
-        # Persist a small heartbeat
         hb = {"when_utc": _stamp(), "archiver": info}
         os.makedirs("reports/metrics", exist_ok=True)
         with open("reports/metrics/housekeeping.json","w", encoding="utf-8") as f:
