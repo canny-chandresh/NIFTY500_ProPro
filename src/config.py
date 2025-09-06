@@ -1,8 +1,7 @@
-# src/config.py
 from __future__ import annotations
 
 CONFIG = {
-    # ---- Feature flags (already used across your repo) ----
+    # ---- Feature flags ----
     "features": {
         "regime_v1": True,
         "sr_pivots_v1": True,
@@ -19,24 +18,24 @@ CONFIG = {
         "sector_cap_enabled": True,
         "max_per_sector": 2,
         "max_total": 5,
-        "force_top5": False,           # keep False for safety
+        "force_top5": False,           # keep False (safer)
         "min_backfill_proba": 0.50,
     },
 
-    # ---- Modes (how many picks each engine aims for) ----
+    # ---- Modes (picks per engine) ----
     "modes": {
         "auto_top_k": 5,
-        "algo_top_k": 10,              # ALGO explores more candidates
+        "algo_top_k": 10,              # ALGO explores more
     },
 
-    # ---- Paper trading cost model (bps round trip) ----
+    # ---- Paper trading costs (round-trip, in bps) ----
     "paper_costs": {
         "equity_bps": 3.0,
         "options_bps": 30.0,
         "futures_bps": 5.0,
     },
 
-    # ---- Notifications (Telegram windows, IST) ----
+    # ---- Notifications (Telegram; IST windows) ----
     "notify": {
         "send_only_at_ist": True,
         "ist_send_hour": 15,
@@ -47,7 +46,7 @@ CONFIG = {
         "eod_window_min": 10,
     },
 
-    # ---- Options runtime cfg (placeholder; keep as-is) ----
+    # ---- Options runtime cfg (placeholder) ----
     "options": {
         "enabled": True,
         "min_iv": 0.0,
@@ -56,10 +55,10 @@ CONFIG = {
 
     # ---- Live trading toggles (SAFE DEFAULTS) ----
     "live": {
-        "dry_run": True,               # hard safety: never place real orders if True
+        "dry_run": True,               # hard safety: no live orders if True
         "enable_auto_live": False,     # AUTO live? (False by default)
         "enable_algo_live": False,     # allow ALGO to ever go live (False by default)
-        "conditional_algo_live": True, # AI can *request* ALGO live if True (still respects enable_algo_live)
+        "conditional_algo_live": True, # AI can request ALGO live if True
         "broker": {
             "provider": "zerodha",     # or "stub"
             "api_key": "",
@@ -69,11 +68,11 @@ CONFIG = {
         },
         # AI conditions for ALGO live unlock
         "algo_live_rules": {
-            "auto_wr_min": 0.65,       # need AUTO win-rate >= 65% over window
+            "auto_wr_min": 0.65,       # need AUTO win-rate >= 65% (last 10 days)
             "vix_max": 14.0,           # low volatility
             "regimes_ok": ["bull", "neutral"],
-            "max_extra_trades": 3,     # how many ALGO trades can be live
-            "per_trade_cap": 0.10,     # 10% of exposure cap per trade
+            "max_extra_trades": 3,     # ALGO live trades cap
+            "per_trade_cap": 0.10,     # 10% of exposure per trade
             "min_proba": 0.54          # require at least this confidence
         }
     }
