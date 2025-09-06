@@ -22,7 +22,6 @@ def _parse_time(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def _get_cost_bps():
-    # Costs from CONFIG if available; else sensible defaults
     try:
         from config import CONFIG
         c = (CONFIG or {}).get("paper_costs", {})
@@ -32,12 +31,11 @@ def _get_cost_bps():
 
 def _stats_from_trades(df: pd.DataFrame, entry="Entry", tgt="Target", sl="SL", kind="equity") -> dict:
     """
-    Compute trades, win_rate, pnl (currency units), ret_vol, max_drawdown.
-    If 'PnL' column exists, we still recompute proxy and prefer 'PnL' only if present & numeric.
-    Costs are subtracted via simple bps model.
+    Compute trades, win_rate, pnl (currency), ret_vol, max_drawdown, sharpe.
+    PnL proxy is based on entry and realized (tp/sl), minus round-trip costs.
     """
     if df is None or df.empty:
-        return {"trades": 0, "win_rate": 0.0, "pnl": 0.0, "ret_vol": 0.0, "max_drawdown": 0.0}
+        return {"trades": 0, "win_rate": 0.0, "pnl": 0.0, "ret_vol": 0.0, "max_drawdown": 0.0, "sharpe": 0.0}
 
     eq_bps, opt_bps, fut_bps = _get_cost_bps()
     cost_bps = {"equity":eq_bps, "options":opt_bps, "futures":fut_bps}.get(kind, eq_bps) / 10000.0
@@ -50,19 +48,19 @@ def _stats_from_trades(df: pd.DataFrame, entry="Entry", tgt="Target", sl="SL", k
     d[tgt]   = pd.to_numeric(d[tgt],   errors="coerce").fillna(d[entry])
     d[sl]    = pd.to_numeric(d[sl],    errors="coerce").fillna(d[entry])
 
-    # Proxy realized return per trade: (win leg + loss leg) / entry
-    per_trade_ret = ((d[tgt] - d[entry]).clip(lower=0) + (d[sl] - d[entry]).clip(upper=0)) / d[entry].replace(0, 1)
-    # Subtract simple round-trip costs
-    per_trade_ret = per_trade_ret - 2.0 * cost_bps
+    # Proxy realized return per trade
+    per_ret = ((d[tgt] - d[entry]).clip(lower=0) + (d[sl] - d[entry]).clip(upper=0)) / d[entry].replace(0, 1)
+    # Round-trip costs
+    per_ret = per_ret - 2.0 * cost_bps
 
-    pnl_proxy = (per_trade_ret * d[entry]).sum()  # in "entry currency" units
-    wins = (d[tgt] > d[entry]).sum()
+    pnl_proxy = float((per_ret * d[entry]).sum())  # in entry currency units
+    wins = int((d[tgt] > d[entry]).sum())
     trades = max(1, len(d))
     wr = wins / trades
-    vol = float(per_trade_ret.std()) if len(per_trade_ret) > 1 else 0.0
+    vol = float(per_ret.std()) if len(per_ret) > 1 else 0.0
 
     # Max drawdown on cumulative equity curve
-    eq = (1.0 + per_trade_ret.fillna(0)).cumprod()
+    eq = (1.0 + per_ret.fillna(0)).cumprod()
     peak = 1.0
     max_dd = 0.0
     for v in eq:
@@ -70,12 +68,17 @@ def _stats_from_trades(df: pd.DataFrame, entry="Entry", tgt="Target", sl="SL", k
         max_dd = min(max_dd, (v / peak - 1.0))
     max_dd = abs(float(max_dd))
 
+    # Simple Sharpe: mean/std per-trade (risk-free ~0)
+    mean_r = float(per_ret.mean()) if len(per_ret) else 0.0
+    sharpe = float(mean_r / vol) if vol > 1e-9 else 0.0
+
     return {
         "trades": int(len(d)),
         "win_rate": float(wr),
-        "pnl": float(pnl_proxy),
+        "pnl": pnl_proxy,
         "ret_vol": float(abs(vol)),
-        "max_drawdown": float(max_dd)
+        "max_drawdown": float(max_dd),
+        "sharpe": sharpe
     }
 
 def summarize_last_n(days: int = 10) -> dict:
