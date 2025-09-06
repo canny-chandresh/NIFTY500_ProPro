@@ -8,6 +8,8 @@ AI_LOG = "reports/metrics/ai_policy_log.json"
 SUSPEND_FLAG = "reports/metrics/ai_policy_suspended.json"
 ALGO_FLAG = "reports/metrics/algo_live_flag.json"
 
+# --------------------- small io helpers ---------------------
+
 def _jload(path):
     if os.path.exists(path):
         try: return json.load(open(path))
@@ -22,6 +24,8 @@ def _save_log(rec: dict):
         except Exception: hist = []
     hist.append(rec)
     json.dump(hist[-300:], open(AI_LOG, "w"), indent=2)
+
+# ------------------- context (VIX / GIFT / news / regime) -------------------
 
 def _latest_vix():
     p = "datalake/vix_daily.parquet"
@@ -61,7 +65,12 @@ def build_context():
         "regime": _regime_hint(),
     }
 
+# ------------------------- suspension / kill-switch-ish -------------------------
+
 def _maybe_suspend_policy() -> bool:
+    """
+    If recent AUTO win-rate is very poor, temporarily reduce aggressiveness by abstaining.
+    """
     try:
         from metrics_tracker import summarize_last_n
         metr = summarize_last_n(days=5)
@@ -73,7 +82,7 @@ def _maybe_suspend_policy() -> bool:
     except Exception:
         return False
 
-# -------- dynamic risk helpers (config + tuner) ----------
+# ------------------------- dynamic TP/SL support -------------------------
 
 def _risk_cfg():
     return ((CONFIG.get("risk") or {}).get("dynamic") or {})
@@ -91,14 +100,16 @@ def _mode_from_df_or_env(df: pd.DataFrame) -> str:
 def _percent_tp_sl_for_mode(mode: str) -> tuple[float,float]:
     per_mode = (_risk_cfg().get("per_mode") or {})
     prof = (per_mode.get(mode) or per_mode.get("swing") or {})
-    tp = float(prof.get("tp_pct", 0.05))
-    sl = float(prof.get("sl_pct", 0.025))
+    tp = float(prof.get("tp_pct", 0.05))   # default 5%
+    sl = float(prof.get("sl_pct", 0.025))  # default 2.5%
     return tp, sl
 
 def _apply_context_multipliers(tp: float, sl: float, ctx: dict) -> tuple[float,float]:
     vix = ctx.get("vix", None)
     regime = (ctx.get("regime") or "neutral").lower()
     cfg = _risk_cfg()
+
+    # VIX adjust
     vx = cfg.get("vix_adjust") or {}
     lt = float(vx.get("low_thresh", 12.0))
     ht = float(vx.get("high_thresh", 18.0))
@@ -111,6 +122,8 @@ def _apply_context_multipliers(tp: float, sl: float, ctx: dict) -> tuple[float,f
             m = vx.get("high") or {}
             tp *= float(m.get("tp_mult", 1.0))
             sl *= float(m.get("sl_mult", 1.0))
+
+    # Regime adjust
     rg = (cfg.get("regime_adjust") or {}).get(regime) or {}
     tp *= float(rg.get("tp_mult", 1.0))
     sl *= float(rg.get("sl_mult", 1.0))
@@ -122,6 +135,8 @@ def _clamp(tp_pct: float, sl_pct: float) -> tuple[float,float]:
     sl_min = float(cl.get("sl_min_pct", 0.004)); sl_max = float(cl.get("sl_max_pct", 0.040))
     return (float(max(tp_min, min(tp_pct, tp_max))),
             float(max(sl_min, min(sl_pct, sl_max))))
+
+# ------------------------- base thresholds & sizing -------------------------
 
 def _thresholds_base(ctx: dict, purpose: str) -> dict:
     thr = {
@@ -135,16 +150,19 @@ def _thresholds_base(ctx: dict, purpose: str) -> dict:
     news_risk = ctx.get("news_risk", 0)
 
     if vix is not None:
-        if vix >= 18:
+        if vix >= 18:  # volatile
             thr["min_proba"] += 0.03; thr["exposure_cap"] = 0.7
-        elif vix <= 12:
+        elif vix <= 12:  # calm
             thr["min_proba"] -= 0.02
+
     if regime == "bull":
         thr["exposure_cap"] = min(1.0, thr["exposure_cap"] + 0.1)
     elif regime == "bear":
         thr["min_proba"] += 0.02; thr["exposure_cap"] = min(thr["exposure_cap"], 0.6)
+
     if gift < -0.01:
         thr["min_proba"] += 0.01; thr["exposure_cap"] = min(thr["exposure_cap"], 0.75)
+
     if news_risk >= 2:
         thr["min_proba"] += 0.02; thr["exposure_cap"] = min(thr["exposure_cap"], 0.65)
 
@@ -158,6 +176,8 @@ def _thresholds_base(ctx: dict, purpose: str) -> dict:
     thr["exposure_cap"] = float(max(0.3, min(1.0, thr["exposure_cap"])))
     return thr
 
+# ------------------------- TP/SL recompute (ATR-first) -------------------------
+
 def _recalc_tp_sl(df: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     if df is None or df.empty: return df
     dyn = (_risk_cfg() or {})
@@ -167,7 +187,7 @@ def _recalc_tp_sl(df: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     mode = _mode_from_df_or_env(df)
     tp_pct, sl_pct = _percent_tp_sl_for_mode(mode)
 
-    # Try the ATR tuner first
+    # Ask the ATR tuner for multipliers (primary path)
     tp_atr = sl_atr = None
     try:
         from atr_tuner import get_multipliers
@@ -175,35 +195,35 @@ def _recalc_tp_sl(df: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     except Exception:
         pass
 
-    use_atr = bool(dyn.get("use_atr", True))
-    # If tuner returns None (options or no ATR policy), fall back to config multipliers
+    # Fallback to config multipliers if tuner returns None (e.g., options)
     if tp_atr is None or sl_atr is None:
-        # config fallbacks:
         prof = (dyn.get("per_mode", {}).get(mode) or {})
         tp_atr = prof.get("tp_atr", None)
         sl_atr = prof.get("sl_atr", None)
 
+    # Compute
     d = df.copy()
     entry = d["Entry"].astype(float)
 
-    # Context multipliers
+    # Context multipliers for % distances (we’ll apply to ATR-implied pct as well)
     tp_pct_ctx, sl_pct_ctx = _apply_context_multipliers(tp_pct, sl_pct, ctx)
 
-    # Try ATR if allowed and columns exist and we have multipliers
+    # Try ATR if allowed and ATR column present and we have multipliers
     atr_col = None
     for c in ("ATR","atr","atr14","ATR14"):
         if c in d.columns:
             atr_col = c; break
 
+    use_atr = bool(dyn.get("use_atr", True))
     if use_atr and atr_col and tp_atr and sl_atr:
         tp_dist = d[atr_col].astype(float) * float(tp_atr)
         sl_dist = d[atr_col].astype(float) * float(sl_atr)
 
-        # Convert to pct of price & apply context multipliers relative to nominal pct
+        # Convert to pct of price & apply context scaling relative to nominal pct
         tp_pct_eff = (tp_dist / entry.clip(lower=1e-9)).fillna(0.0) * tp_pct_ctx / max(1e-9, tp_pct)
         sl_pct_eff = (sl_dist / entry.clip(lower=1e-9)).fillna(0.0) * sl_pct_ctx / max(1e-9, sl_pct)
 
-        # Clamp
+        # Reduce to representative value & clamp
         if hasattr(tp_pct_eff, "values"):
             tp_eff = float(max(tp_pct_eff.min(), min(tp_pct_eff.max(), tp_pct_eff.mean())))
             sl_eff = float(max(sl_pct_eff.min(), min(sl_pct_eff.max(), sl_pct_eff.mean())))
@@ -221,11 +241,14 @@ def _recalc_tp_sl(df: pd.DataFrame, ctx: dict) -> pd.DataFrame:
 
     return d
 
+# ------------------------- main policy & algo-live gate -------------------------
+
 def apply_policy(raw_df: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     if raw_df is None or raw_df.empty:
         _save_log({"when_utc": ctx.get("when_utc"), "decisions": 0, "reason": "empty_raw"})
         return raw_df
 
+    # temporary suspension if performance too poor
     if _maybe_suspend_policy():
         out = raw_df.sort_values("proba", ascending=False).head(3).reset_index(drop=True)
         _save_log({"when_utc": ctx.get("when_utc"), "decisions": len(out), "reason": "ai_policy_suspended"})
@@ -234,19 +257,23 @@ def apply_policy(raw_df: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     purpose = os.environ.get("RUN_PURPOSE", "auto").strip().lower()
     thr = _thresholds_base(ctx, purpose)
 
+    # 1) confidence filter
     df = raw_df.copy()
     df = df[df["proba"] >= thr["min_proba"]].copy()
     if df.empty:
         _save_log({"when_utc": ctx.get("when_utc"), "decisions": 0, "policy": thr, "reason": "min_proba_filter"})
         return df
 
+    # 2) abstain if low dispersion and low average confidence
     disp = float(df["proba"].std()) if len(df) > 1 else 0.0
     if disp < 0.01 and df["proba"].mean() < (thr["min_proba"] + 0.01):
         _save_log({"when_utc": ctx.get("when_utc"), "decisions": 0, "policy": thr, "reason": "abstain_low_conf"})
         return df.iloc[0:0]
 
+    # 3) dynamic TP/SL (ATR-first) + clamps
     df = _recalc_tp_sl(df, ctx)
 
+    # 4) picks & sizing
     df = df.sort_values("proba", ascending=False).head(thr["max_picks"]).reset_index(drop=True)
     weights = (df["proba"] - thr["min_proba"] + 1e-9)
     weights = weights / weights.sum()
@@ -263,17 +290,25 @@ def apply_policy(raw_df: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     return df
 
 def decide_algo_live(ctx: dict) -> dict:
-    from config import CONFIG
+    """
+    AI gatekeeper for ALGO going live. Writes reports/metrics/algo_live_flag.json
+    and returns {"allowed": bool, "reason": str, ...}
+    """
     live_cfg = CONFIG.get("live", {})
     rules = live_cfg.get("algo_live_rules", {})
     enable_algo_live = bool(live_cfg.get("enable_algo_live", False))
     conditional = bool(live_cfg.get("conditional_algo_live", True))
     dry_run = bool(live_cfg.get("dry_run", True))
+
     out = {"allowed": False, "dry_run": dry_run, "conditional": conditional, "enable_algo_live": enable_algo_live}
-    if not enable_algo_live: out["reason"] = "enable_algo_live_false"
-    elif dry_run: out["reason"] = "dry_run_true"
+
+    if not enable_algo_live:
+        out["reason"] = "enable_algo_live_false"
+    elif dry_run:
+        out["reason"] = "dry_run_true"
     elif not conditional:
-        out["allowed"] = True; out["reason"] = "conditional_false_allow_all"
+        out["allowed"] = True
+        out["reason"] = "conditional_false_allow_all"
     else:
         try:
             from metrics_tracker import summarize_last_n
@@ -281,13 +316,18 @@ def decide_algo_live(ctx: dict) -> dict:
             auto_wr = float((metr.get("AUTO") or {}).get("win_rate", 0.0))
         except Exception:
             auto_wr = 0.0
+
         vix = ctx.get("vix") or 99.0
         regime = (ctx.get("regime") or "neutral").lower()
-        if auto_wr >= float(rules.get("auto_wr_min", 0.65)) and vix <= float(rules.get("vix_max", 14.0)) and \
+
+        if auto_wr >= float(rules.get("auto_wr_min", 0.65)) and \
+           vix <= float(rules.get("vix_max", 14.0)) and \
            regime in set([r.lower() for r in rules.get("regimes_ok", ["bull","neutral"])]):
-            out["allowed"] = True; out["reason"] = "conditions_met"
+            out["allowed"] = True
+            out["reason"] = "conditions_met"
         else:
             out["reason"] = f"conditions_not_met wr={auto_wr:.2f} vix={vix} regime={regime}"
+
     os.makedirs(os.path.dirname(ALGO_FLAG) or ".", exist_ok=True)
     json.dump({**out, "when_utc": dt.datetime.utcnow().isoformat()+"Z"}, open(ALGO_FLAG,"w"), indent=2)
     return out
