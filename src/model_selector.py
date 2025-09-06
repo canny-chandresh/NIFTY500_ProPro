@@ -1,6 +1,5 @@
 from __future__ import annotations
 import os
-from typing import Tuple
 import pandas as pd
 
 try:
@@ -9,7 +8,6 @@ except Exception:
     CONFIG = {"selection":{"sector_cap_enabled":False,"max_per_sector":2,"max_total":5},
               "modes":{"auto_top_k":5}}
 
-# -------- helpers: sector map / caps / schema --------
 def _load_sector_map():
     try:
         p = os.path.join("datalake","sector_map.csv")
@@ -67,7 +65,6 @@ def _normalize_cols(df: pd.DataFrame, reason_tag: str) -> pd.DataFrame:
     if "proba" in d.columns: d=d.sort_values("proba",ascending=False,kind="mergesort")
     return d
 
-# -------- model arms --------
 def _try_dl(top_k:int):
     try:
         import dl_runner
@@ -99,7 +96,6 @@ def _try_light(top_k:int):
     except Exception:
         return pd.DataFrame(), "light_error"
 
-# -------- AI selection + (policy + risk) inside --------
 def choose_and_predict_full(top_k:int=5):
     """
     Pick among {'dl','robust','light'} via ai_ensemble, then apply:
@@ -131,7 +127,7 @@ def choose_and_predict_full(top_k:int=5):
     if raw is None or raw.empty:
         return pd.DataFrame(columns=["Symbol","Entry","SL","Target","proba","Reason"]), "none"
 
-    # Apply AI policy + risk guardrails *inside* selector (so pipeline need not change)
+    # Apply AI policy + risk
     try:
         from ai_policy import build_context, apply_policy
         from risk_manager import apply_guardrails
@@ -141,7 +137,7 @@ def choose_and_predict_full(top_k:int=5):
     except Exception:
         pass
 
-    # record which model actually got used (for AI learning history)
+    # record which model actually used
     try:
         import json, datetime as dt
         p = "reports/metrics/ai_ensemble_state.json"
