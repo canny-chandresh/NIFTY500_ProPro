@@ -3,9 +3,9 @@ name: Hourly / Daily / Weekly / Monthly
 on:
   workflow_dispatch: {}
   schedule:
-    # Run every 30 minutes on weekdays (Mon-Fri). We'll self-gate by IST time in code.
+    # Run every 30 minutes on weekdays; code self-gates by IST windows.
     - cron: "*/30 * * * 1-5"
-    # Saturday weekly window around 12:30 IST (07:00 UTC). We'll self-gate for weekly.
+    # Saturday weekly window around 12:30 IST (07:00 UTC); code self-gates.
     - cron: "0 7 * * 6"
 
 jobs:
@@ -34,7 +34,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          # extras we rely on
+          # common extras we use; keep non-fatal
           pip install pandas pyarrow yfinance ta graphviz || true
 
       - name: Ensure datalake exists (optional bootstrap unzip)
@@ -46,7 +46,7 @@ jobs:
               sudo apt-get update -y >/dev/null 2>&1 || true
               sudo apt-get install -y unzip >/dev/null 2>&1 || true
               unzip -o datalake-bootstrap.zip -d . || true
-              # If zipped inside a folder, flatten:
+              # Flatten if nested:
               if [ -d "NIFTY500_ProPro/datalake" ]; then
                 mv NIFTY500_ProPro/datalake ./ && rm -rf NIFTY500_ProPro
               fi
@@ -58,7 +58,7 @@ jobs:
           fi
           mkdir -p reports/metrics reports/html models
 
-      - name: Main orchestrator (pre-open / intraday / 15:15 / EOD / weekly / monthly)
+      - name: Orchestrator (pre-open / intraday / 15:15 / EOD / weekly / monthly)
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID:  ${{ secrets.TG_CHAT_ID }}
@@ -67,30 +67,18 @@ jobs:
           import os, sys, traceback, json, datetime as dt
           from zoneinfo import ZoneInfo
 
-          # Import path
           sys.path.append("src")
 
-          # Helpers
-          def now_ist():
-              return dt.datetime.now(ZoneInfo("Asia/Kolkata"))
+          # ---------------- time gating helpers ----------------
+          def now_ist(): return dt.datetime.now(ZoneInfo("Asia/Kolkata"))
+          t = now_ist(); hhmm = t.strftime("%H:%M"); dow = t.weekday()  # 0=Mon,6=Sun
+          is_bday = (dow <= 4)  # Mon-Fri (add exchange holiday check in src/holidays.py if you have it)
 
-          def is_weekend_ist(t: dt.datetime):
-              # Saturday=5, Sunday=6
-              return t.weekday() >= 5
-
-          # Gating windows (IST)
-          t = now_ist()
-          hhmm = t.strftime("%H:%M")
-          dow = t.weekday()  # 0=Mon, 6=Sun
-          is_bday = (dow <= 4)  # Mon-Fri; (holiday logic can be added via src/holidays.py if you have it)
-
-          # Flags
           do_preopen = is_bday and ("08:30" <= hhmm <= "09:10")
           do_intraday = is_bday and ("09:30" <= hhmm <= "15:15")
           do_315 = is_bday and (hhmm >= "15:15" and hhmm <= "15:20")
           do_eod = is_bday and (hhmm >= "17:00" and hhmm <= "17:10")
           do_weekly = (dow == 5) and ("12:15" <= hhmm <= "12:45")  # Saturday ~12:30 IST
-          # Month-end check: if tomorrow month != today month and after 17:00 IST
           tomorrow = t + dt.timedelta(days=1)
           is_month_end = (t.month != tomorrow.month)
           do_monthly = is_month_end and (hhmm >= "17:00" and hhmm <= "17:30")
@@ -101,7 +89,7 @@ jobs:
               "eod": do_eod, "weekly": do_weekly, "monthly": do_monthly
           }, indent=2))
 
-          # Import modules defensively
+          # ---------------- imports (defensive) ----------------
           try:
               from entrypoints import daily_update, eod_task, periodic_reports_task, after_run_housekeeping
           except Exception as e:
@@ -109,16 +97,16 @@ jobs:
               traceback.print_exc()
               daily_update = eod_task = periodic_reports_task = after_run_housekeeping = None
 
-          # Pre-open warm-up: capture GIFT, VIX, news pulse, update regime
+          # ---------------- PRE-OPEN ----------------
           if do_preopen:
               print("== PRE-OPEN WARM-UP ==")
               try:
                   if daily_update:
-                      daily_update(preopen=True)   # your function can ignore kw if not defined
+                      daily_update(preopen=True)
               except Exception as e:
                   print("preopen error:", e); traceback.print_exc()
 
-          # Intraday hourly: run AI (AUTO + conditional ALGO)
+          # ---------------- INTRADAY (incl. 15:15 picks) ----------------
           if do_intraday or do_315:
               print("== INTRADAY / AI ==")
               try:
@@ -127,76 +115,69 @@ jobs:
                   print(f"AUTO orders: {a}, ALGO orders: {b}")
               except Exception as e:
                   print("pipeline_ai error:", e); traceback.print_exc()
-              # After each intraday block, run housekeeping (drift checks, etc.)
+
+              # Housekeeping after intraday block
               try:
                   if after_run_housekeeping:
                       after_run_housekeeping()
               except Exception as e:
                   print("housekeeping error:", e); traceback.print_exc()
 
-          # 3:15 picks: the same intraday block above already runs at this time;
-          # your Telegram 3:15 send is handled inside your reporting/notify functions.
-          # If you prefer an explicit ensure-send hook, you can add one here.
+              # Self-tune ATR from rolling metrics (learn every run)
+              try:
+                  from ai_policy import build_context
+                  from atr_tuner import update_from_metrics
+                  ctx = build_context()
+                  update_from_metrics(ctx)
+              except Exception as e:
+                  print("atr_tuner update error:", e)
 
-          # EOD compile (5:00 PM IST): send reports and refresh metrics
+          # ---------------- EOD (5:00 PM IST) ----------------
           if do_eod:
               print("== EOD TASKS ==")
               try:
-                  if eod_task:
-                      eod_task()
+                  if eod_task: eod_task()
               except Exception as e:
                   print("eod_task error:", e); traceback.print_exc()
               try:
-                  if periodic_reports_task:
-                      periodic_reports_task()  # may roll daily aggregates
+                  if periodic_reports_task: periodic_reports_task()
               except Exception as e:
                   print("periodic_reports_task error:", e); traceback.print_exc()
               try:
-                  if after_run_housekeeping:
-                      after_run_housekeeping()
+                  if after_run_housekeeping: after_run_housekeeping()
               except Exception as e:
                   print("housekeeping(EOD) error:", e); traceback.print_exc()
 
-          # Weekly (Saturday) roll-up
+          # ---------------- WEEKLY (Saturday) ----------------
           if do_weekly:
               print("== WEEKLY REPORT ==")
               try:
-                  if periodic_reports_task:
-                      periodic_reports_task(kind="weekly")
+                  if periodic_reports_task: periodic_reports_task(kind="weekly")
               except Exception as e:
                   print("weekly error:", e); traceback.print_exc()
 
-          # Month-end roll-up
+          # ---------------- MONTHLY (month-end after hours) ----------------
           if do_monthly:
               print("== MONTHLY REPORT ==")
               try:
-                  if periodic_reports_task:
-                      periodic_reports_task(kind="monthly")
+                  if periodic_reports_task: periodic_reports_task(kind="monthly")
               except Exception as e:
                   print("monthly error:", e); traceback.print_exc()
 
-          # Always: print AI status to logs for visibility
+          # ---------------- Print status snapshot to logs ----------------
           try:
               from status_probe import print_status
               print_status()
           except Exception:
               pass
 
-          # Optional: Telegram alert if AI is suspended
-          try:
-              from alerts import alert_if_suspended
-              alert_if_suspended()
-          except Exception:
-              pass
-
-          # Never hard-fail the job; we want schedules to continue even if one block errs
+          # Never hard-fail the job; keep schedules running even on partial errors
           PY
 
       - name: Bundle reports (if any) as artifact
         if: always()
         run: |
           mkdir -p out_bundle
-          # common report outputs — adjust paths if your repo differs
           cp -r reports out_bundle/reports || true
           cp -r datalake out_bundle/datalake_snapshot || true
           tar -czf reports_bundle.tgz -C out_bundle .
