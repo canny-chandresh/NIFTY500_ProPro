@@ -1,4 +1,3 @@
-# src/live_router.py
 from __future__ import annotations
 import os, csv, datetime as dt
 from typing import Dict, Any
@@ -34,12 +33,11 @@ def submit(symbol: str, side: str, qty: int, entry: float, sl: float, tp: float,
         "Meta": str(meta)
     }
 
-    # persist to datalake
     target = {
         "AUTO": "datalake/paper_trades.csv" if mode_tag=="PAPER" else "datalake/live_trades.csv",
         "ALGO": "datalake/algo_paper.csv"   if mode_tag=="PAPER" else "datalake/algo_live.csv",
-        "OPTIONS": "datalake/options_paper.csv",
-        "FUTURES": "datalake/futures_paper.csv",
+        "OPTIONS": "datalake/options_paper.csv",   # extend live later
+        "FUTURES": "datalake/futures_paper.csv",   # extend live later
     }.get(book, "datalake/paper_trades.csv")
 
     header = ["Timestamp","Book","Mode","Symbol","Side","Entry","SL","Target","Qty","Meta"]
@@ -48,5 +46,4 @@ def submit(symbol: str, side: str, qty: int, entry: float, sl: float, tp: float,
     # live route (only if LIVE and not dry_run)
     live_cfg = CONFIG.get("live", {})
     if mode_tag == "LIVE" and not bool(live_cfg.get("dry_run", True)):
-        # basic example; replace with actual order sizing/price logic as needed
         broker_iface.place_order(symbol, side, qty, entry, meta)
