@@ -1,74 +1,76 @@
 # src/feature_promoter.py
+"""
+Promote candidate features to AUTO_* with caps:
+- p_value <= 0.01
+- stable sign over N windows
+- max promotions/week cap
+Writes: datalake/features_auto/<symbol>_auto.csv and config/promoted_features.yaml
+"""
 from __future__ import annotations
-import json, yaml, datetime as dt
 from pathlib import Path
-import pandas as pd
-import numpy as np
+import pandas as pd, numpy as np, yaml, datetime as dt
 
-CAT = Path("reports/auto_features/catalog.json")
-SPEC = Path("config/feature_spec.yaml")
-PROM = Path("config/promoted_features.yaml")
+CAND = Path("datalake/auto_candidates")
+AUTO = Path("datalake/features_auto"); AUTO.mkdir(parents=True, exist_ok=True)
+PROM = Path("config/promoted_features.yaml"); PROM.parent.mkdir(parents=True, exist_ok=True)
 
-DEFAULT_RULES = {
-    "min_ic": 0.02,               # minimum Information Coefficient
-    "min_stability": 0.60,        # H1 vs H2 IC closeness
-    "max_psi": 0.20,              # drift guard (lower is better)
-    "max_per_symbol": 3,          # avoid overfitting per name
-    "max_total": 30               # promote at most this many features globally
-}
+def _tstat(x: pd.Series, y: pd.Series) -> float:
+    # simple correlation->t heuristic
+    x, y = x.dropna(), y.dropna()
+    n = min(len(x), len(y))
+    if n < 60: return 0.0
+    r = pd.concat([x, y], axis=1).corr().iloc[0,1]
+    if pd.isna(r): return 0.0
+    return float(r * np.sqrt((n-2)/(1-r**2 + 1e-9)))
 
-def _load_catalog() -> pd.DataFrame:
-    if not CAT.exists(): return pd.DataFrame()
-    return pd.read_json(CAT)
+def run_promoter(max_weekly_promotions: int = 10, stability_windows: int = 6) -> dict:
+    if not CAND.exists(): return {"ok": False, "reason": "no_candidates"}
+    promoted = {"auto_features": []}
+    if PROM.exists():
+        promoted = yaml.safe_load(PROM.read_text()) or promoted
 
-def _load_spec(path: Path) -> dict:
-    if not path.exists(): return {"features": [], "targets": []}
-    return yaml.safe_load(path.read_text())
+    added = 0
+    for p in sorted(CAND.glob("*_candidates.csv")):
+        sym = p.stem.replace("_candidates","")
+        df = pd.read_csv(p, parse_dates=["Date"])
+        if "y_1d" not in df.columns: continue
+        tgt = df["y_1d"]
+        # examine candidate columns prefixed CAND_
+        cols = [c for c in df.columns if c.startswith("CAND_")]
+        keep = []
+        for c in cols:
+            t = _tstat(df[c], tgt)
+            # p-value approx threshold |t| > 2.58 (~p<=0.01)
+            if abs(t) < 2.58: continue
+            # stability: sign of rolling corr stays same across windows
+            win = max(40, len(df)//stability_windows)
+            signs = []
+            for i in range(stability_windows):
+                sl = df.iloc[i*win:(i+1)*win]
+                if len(sl) < 30: continue
+                r = sl[c].corr(sl["y_1d"])
+                signs.append(np.sign(r if not pd.isna(r) else 0))
+            if len(signs) >= max(3, stability_windows-2) and (abs(sum(signs)) >= len(signs)-1):
+                keep.append(c)
+        if not keep: continue
+        # cap promotions per week
+        quota = max_weekly_promotions - added
+        if quota <= 0: break
+        sel = keep[:quota]
+        # write/merge AUTO file
+        out = df[["Date"] + sel].copy()
+        out.columns = ["Date"] + [f"AUTO_{c[5:]}" for c in sel]
+        auto_path = AUTO / f"{sym}_auto.csv"
+        try:
+            prev = pd.read_csv(auto_path, parse_dates=["Date"])
+            out = prev.merge(out, on="Date", how="outer")
+        except Exception:
+            pass
+        out.to_csv(auto_path, index=False)
+        # update catalog
+        for c in sel:
+            promoted["auto_features"].append({"source": f"AUTO::{c[5:]}", "symbol": sym, "added": dt.datetime.utcnow().isoformat()+"Z"})
+        added += len(sel)
 
-def _save_yaml(path: Path, data: dict):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
-
-def select_candidates(df: pd.DataFrame, rules=DEFAULT_RULES) -> pd.DataFrame:
-    d = df.copy()
-    if d.empty: return d
-    # basic filters
-    d = d[(d["ic"] >= rules["min_ic"]) & (d["stability"] >= rules["min_stability"])]
-    d = d[(d["psi"].isna()) | (d["psi"] <= rules["max_psi"])]
-    # dedupe by (feature) keep best symbol
-    d = d.sort_values(["feature","ic"], ascending=[True, False]).drop_duplicates("feature")
-    # cap per symbol
-    d["sym_rank"] = d.groupby("symbol")["ic"].rank(ascending=False, method="first")
-    d = d[d["sym_rank"] <= rules["max_per_symbol"]]
-    # global cap
-    d = d.sort_values("ic", ascending=False).head(rules["max_total"])
-    return d.drop(columns=["sym_rank"])
-
-def write_promotions(cands: pd.DataFrame):
-    """
-    We write a small sidecar YAML that your features_builder can read to merge AUTO features.
-    Each promoted feature becomes a generic column name, sourced from AUTO::<feature>.
-    """
-    spec = _load_spec(PROM)
-    cur = spec.get("auto_features", [])
-    for _, r in cands.iterrows():
-        cur.append({
-            "name": f"AUTO_{r['feature']}",
-            "source": f"AUTO::{r['feature']}",
-            "notes": f"auto-promoted from {r['symbol']} ic={r['ic']:.3f} stab={r['stability']:.2f} psi={r['psi']}"
-        })
-    spec["auto_features"] = cur
-    spec["when_utc"] = dt.datetime.utcnow().isoformat()+"Z"
-    _save_yaml(PROM, spec)
-    return PROM
-
-def run_promoter():
-    df = _load_catalog()
-    if df.empty:
-        return {"promoted": 0, "reason": "no_catalog"}
-    sel = select_candidates(df)
-    path = write_promotions(sel)
-    return {"promoted": int(len(sel)), "promoted_file": str(path)}
-
-if __name__ == "__main__":
-    print(run_promoter())
+    PROM.write_text(yaml.safe_dump(promoted, sort_keys=False), encoding="utf-8")
+    return {"ok": True, "added": added}
