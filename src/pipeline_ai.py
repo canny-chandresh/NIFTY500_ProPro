@@ -22,7 +22,6 @@ config          = _opt("config")
 model_selector  = _opt("model_selector")
 engine_registry = _opt("engine_registry")
 ai_policy_mod   = _opt("ai_policy")             # optional: policy rules/learning
-risk_v2         = _opt("risk_engine_v2")        # optional: CVaR/Kelly sizing
 hygiene_checks  = _opt("hygiene_checks")        # optional: PSI/KS checks
 feature_spec    = _opt("feature_spec")          # optional: spec validator
 live_equity_alt = _opt("live_equity_alt")       # optional: intraday equity fetch
@@ -33,6 +32,12 @@ report_eod_mod  = _opt("report_eod")            # optional: EOD text+html
 telegram_mod    = _opt("telegram")              # optional: Telegram send
 utils_time      = _opt("utils_time")
 regime_mod      = _opt("regime")
+
+# *** NEW priority-upgrade modules (defensive imports) ***
+automl_tuner    = _opt("automl_tuner")
+feature_store   = _opt("feature_store")
+execution_sim   = _opt("execution_simulator")
+risk_v2         = _opt("risk_engine_v2")        # VaR/exposure + laddered kill switch
 
 # ---------- Paths / Config ----------
 CONFIG = getattr(config, "CONFIG", {}) if config else {}
@@ -103,8 +108,7 @@ def _best_effort_price(symbol: str) -> float:
     f = FEAT / f"{symbol}_features.csv"
     try:
         df = pd.read_csv(f)
-        # if you store price column (e.g. Close), prefer that; else use ret proxy
-        if "Close" in df.columns:
+        if "Close" in df.columns and len(df):
             return float(df["Close"].iloc[-1])
         return float(df.get("MAN_ret1", pd.Series([0])).iloc[-1] * 100 + 100)
     except Exception:
@@ -137,14 +141,12 @@ def refresh_live(symbols: List[str]) -> Dict:
                 chain.to_csv(od / f"{osm}_chain_{ts}.csv", index=False)
                 out["options_rows"] = int(len(chain))
         except Exception:
-            # fallback synthetic handled within options_live_multi typically
             pass
     return out
 
 # ---------- Regime-aware ATR multiplier ----------
 def _regime_mult(df_last: pd.DataFrame) -> float:
     if not ATR_POL or not ATR_POL.get("enable", True): return 1.0
-    # heuristics: use regime_flag in last row, else neutral
     if "regime_flag" in df_last.columns and len(df_last):
         rf = int(df_last["regime_flag"].iloc[0])
         if rf > 0: key = "bull"
@@ -177,13 +179,13 @@ def ai_blend(preds: pd.DataFrame, df_last: pd.DataFrame) -> pd.DataFrame:
         except Exception as e:
             print("[pipeline_ai] ai_policy.refine failed:", e)
     else:
-        # default decision mapping
+        # default mapping
         z = (blend["Score"] - blend["Score"].mean()) / (blend["Score"].std() + 1e-9)
         conf = (0.5 + np.tanh(z)/2.5).clip(0.2, 0.98)
         blend["Decision"] = np.where(z > 0, "BUY", "HOLD")
         blend["Confidence"] = conf
 
-    # regime-aware ATR multiplier: adjust confidence slightly
+    # regime-aware ATR multiplier
     mult = _regime_mult(df_last)
     blend["Confidence"] = (blend["Confidence"] * mult).clip(0.1, 0.99)
 
@@ -194,7 +196,6 @@ def ai_blend(preds: pd.DataFrame, df_last: pd.DataFrame) -> pd.DataFrame:
 def _apply_sector_caps(top: pd.DataFrame, df_last: pd.DataFrame, cap: int) -> pd.DataFrame:
     if not SECTOR_CAP or cap <= 0 or df_last.empty or "sector" not in df_last.columns:
         return top
-    # Map symbol -> sector from df_last
     m = df_last.set_index("symbol")["sector"].to_dict()
     counts = {}
     kept = []
@@ -282,8 +283,9 @@ def ai_hourly(top_k: int = TOP_K) -> Dict:
     3) Train/predict across engines
     4) AI blend (policy)
     5) Sector caps, Top-K
-    6) Paper log
-    7) Pulse + Hygiene/Spec
+    6) Pre-trade risk (laddered kill switch)
+    7) Paper log
+    8) Pulse + Hygiene/Spec
     """
     syms = _symbols()
     feeds = refresh_live(syms)
@@ -311,6 +313,14 @@ def ai_hourly(top_k: int = TOP_K) -> Dict:
         blended = _apply_sector_caps(blended, df_last, SECTOR_LIM)
 
     picks = blended.head(top_k) if not blended.empty else blended
+
+    # *** NEW: pre-trade risk tightening (laddered kill-switch) ***
+    if risk_v2 and not picks.empty:
+        try:
+            picks = risk_v2.pretrade_filter(CONFIG, picks, df_last)
+        except Exception as e:
+            print("[pipeline_ai] risk_v2.pretrade_filter failed:", e)
+
     paper = log_paper_trades(picks)
 
     # Pulse & hygiene/spec
@@ -336,11 +346,23 @@ def ai_eod(top_k: int = TOP_K) -> Dict:
     rep = build_eod_reports()
     _send_tg("📄 AI EOD report generated")
     status = {"when": _now(), "report": rep}
+
+    # *** NEW: execution realism + post-trade risk summary ***
+    if execution_sim:
+        try:
+            status["execution"] = execution_sim.simulate(CONFIG)
+        except Exception as e:
+            status["execution_error"] = str(e)
+    if risk_v2:
+        try:
+            status["risk"] = risk_v2.posttrade_report(CONFIG)
+        except Exception as e:
+            status["risk_error"] = str(e)
+
     (REP_DIR / "ai_eod_status.json").write_text(json.dumps(status, indent=2), encoding="utf-8")
     return status
 
 def ai_weekly() -> Dict:
-    # placeholder: you may plug stress tests here
     _send_tg("🗓️ AI Weekly diagnostics completed")
     status = {"when": _now(), "ok": True}
     (REP_DIR / "ai_weekly_status.json").write_text(json.dumps(status, indent=2), encoding="utf-8")
@@ -355,3 +377,18 @@ def ai_monthend() -> Dict:
 # Backward-compat entry
 def run_paper_session(top_k: int = TOP_K) -> Dict:
     return ai_hourly(top_k=top_k)
+
+# *** NEW: Nightly AutoML job (optional, cron-triggered in workflow) ***
+def ai_nightly_automl() -> Dict:
+    if not automl_tuner:
+        return {"ok": False, "reason": "automl_tuner_missing"}
+    df_all = _load_features(limit_files=400)
+    if df_all.empty:
+        return {"ok": False, "reason": "no_features"}
+    train = df_all.groupby("symbol").apply(lambda x: x.iloc[:-1]).reset_index(drop=True)
+    try:
+        res = automl_tuner.run_automl(train, CONFIG, tag="ml")
+    except Exception as e:
+        res = {"ok": False, "error": str(e)}
+    (REP_DIR / "ai_nightly_automl.json").write_text(json.dumps(res, indent=2), encoding="utf-8")
+    return res
