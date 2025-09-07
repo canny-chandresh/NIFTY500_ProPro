@@ -1,5 +1,30 @@
-pandas
-numpy
-requests
-pandera
-joblib
+# Core
+pandas>=2.0
+numpy>=1.24
+scikit-learn>=1.4
+xgboost>=2.0
+
+# Market data
+yfinance>=0.2
+requests>=2.31
+
+# Graph / GNN
+networkx>=3.2
+
+# Deep Learning
+torch>=2.2
+torchvision>=0.17
+torchaudio>=2.2
+
+# NLP / News (optional expansion later)
+transformers>=4.40
+
+# Explainability
+shap>=0.44
+
+# Data formats
+pyarrow>=15.0
+
+# Utilities
+matplotlib>=3.8
+seaborn>=0.13
