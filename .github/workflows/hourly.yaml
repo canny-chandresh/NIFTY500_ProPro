@@ -1,4 +1,4 @@
-name: Hourly Train & Reports (with one-time auto-backfill)
+name: Hourly Train & Reports (with one-time auto-backfill + nightly AutoML)
 
 on:
   schedule:
@@ -10,6 +10,8 @@ on:
     - cron: "30 11 * * 1-5"
     # Weekly diagnostics (Saturday IST 10:00 => UTC 04:30 Sat)
     - cron: "30 4 * * 6"
+    # Nightly AutoML (IST 02:00 => UTC 20:30 previous day)
+    - cron: "30 20 * * 1-5"
   workflow_dispatch: {}
 
 jobs:
@@ -41,10 +43,6 @@ jobs:
           echo "== datalake/per_symbol ==" && ls -la datalake/per_symbol || true
 
       # ---------- ONE-TIME AUTO-BACKFILL ----------
-      # If no features or per_symbol data present:
-      # 1) Try to unpack datalake-bootstrap.zip if it exists
-      # 2) Otherwise, pull ~60 days from Yahoo for a symbol list we discover
-      #    (sector_map.csv if available, else a small NIFTY set), and create minimal features.
       - name: One-time auto-backfill (if datalake is empty)
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
@@ -65,7 +63,6 @@ jobs:
           PER.mkdir(parents=True, exist_ok=True)
           FEAT.mkdir(parents=True, exist_ok=True)
 
-          # Quick check whether we already have data
           per_cnt = len(list(PER.glob("*.csv")))
           feat_cnt = len(list(FEAT.glob("*_features.csv")))
           status = {"per_symbol_csv": per_cnt, "features_csv": feat_cnt, "action": "skip"}
@@ -73,22 +70,17 @@ jobs:
           if per_cnt > 0 and feat_cnt > 0:
               print("[auto-backfill] datalake already populated — skipping.")
           else:
-              # First, try bootstrap ZIP if present
               boot = ROOT / "datalake-bootstrap.zip"
               if boot.exists():
                   import zipfile, shutil
                   print("[auto-backfill] Unzipping datalake-bootstrap.zip ...")
                   with zipfile.ZipFile(str(boot), "r") as zf:
                       zf.extractall(ROOT)
-                  # flatten if nested
                   nested = ROOT / "NIFTY500_ProPro" / "datalake"
                   if nested.exists():
                       for child in nested.iterdir():
                           target = DL / child.name
                           if child.is_dir():
-                              if not target.exists():
-                                  target.mkdir(parents=True, exist_ok=True)
-                              # merge directory
                               for sub in child.rglob("*"):
                                   dest = DL / sub.relative_to(nested)
                                   if sub.is_dir():
@@ -100,13 +92,10 @@ jobs:
                               target.write_bytes(child.read_bytes())
                   status["action"] = "unzip_bootstrap"
               else:
-                  # No bootstrap ZIP — do a LIGHT backfill from Yahoo (last 60d)
                   print("[auto-backfill] No bootstrap ZIP; doing light Yahoo backfill (~60d).")
                   import yfinance as yf
-                  import pandas as pd
                   import numpy as np
 
-                  # Try to read tickers from datalake/sector_map.csv if present
                   sector_map = DL / "sector_map.csv"
                   tickers = []
                   if sector_map.exists():
@@ -120,19 +109,13 @@ jobs:
                               tickers = [str(x).strip() for x in dfm[col].dropna().unique().tolist()]
                       except Exception:
                           pass
-                  # fallback small set
                   if not tickers:
                       tickers = ["RELIANCE","HDFCBANK","INFY","ICICIBANK","TCS",
                                  "SBIN","HINDUNILVR","BHARTIARTL","ITC","LT"]
 
-                  # limit for safety on GH runner
                   tickers = tickers[:80]
 
-                  PER.mkdir(parents=True, exist_ok=True)
-                  FEAT.mkdir(parents=True, exist_ok=True)
-
                   def featureize(sym: str, df: pd.DataFrame):
-                      # Minimal features: Date, symbol, returns and a couple of techs
                       if df.empty: return
                       df = df.copy()
                       df["symbol"] = sym
@@ -140,14 +123,15 @@ jobs:
                       df = df[["Date","symbol","Open","High","Low","Close","Volume"]].dropna()
                       df["MAN_ret1"] = df["Close"].pct_change().fillna(0.0)
                       df["MAN_vol20"] = df["MAN_ret1"].rolling(20, min_periods=5).std().fillna(0.0)
-                      # simple ema20 slope proxy
                       ema = df["Close"].ewm(span=20, adjust=False).mean()
                       df["MAN_ema20slope"] = ema.pct_change().fillna(0.0)
-                      # regime placeholder
                       df["regime_flag"] = 0
                       return df
 
                   ok = 0
+                  (DL / "per_symbol").mkdir(parents=True, exist_ok=True)
+                  (DL / "features").mkdir(parents=True, exist_ok=True)
+
                   for sym in tickers:
                       try:
                           yf_ticker = f"{sym}.NS"
@@ -155,13 +139,10 @@ jobs:
                           if hist is None or hist.empty: 
                               continue
                           hist.index = pd.to_datetime(hist.index).tz_localize(None)
-                          # Save per_symbol
-                          p = PER / f"{sym}.csv"
-                          hist.to_csv(p)
-                          # Features
+                          (DL / "per_symbol" / f"{sym}.csv").write_text(hist.to_csv(), encoding="utf-8")
                           fdf = featureize(sym, hist)
                           if fdf is not None and not fdf.empty:
-                              fdf.to_csv(FEAT / f"{sym}_features.csv", index=False)
+                              fdf.to_csv(DL / "features" / f"{sym}_features.csv", index=False)
                               ok += 1
                       except Exception as e:
                           print(f"[auto-backfill] {sym}: {e}")
@@ -173,7 +154,7 @@ jobs:
           print("[auto-backfill] STATUS:", json.dumps(status, indent=2))
           PY
 
-          # Optional: Telegram notify if we actually backfilled
+          # Optional Telegram notice
           python - <<'PY'
           import os, json
           from pathlib import Path
@@ -190,8 +171,6 @@ jobs:
               pass
           PY
 
-      # ---------- MAIN RUN DISPATCH ----------
-      # Map each cron to the right phase (hourly/market, EOD, weekly)
       - name: Import smoke (non-fatal)
         run: |
           python - <<'PY'
@@ -214,7 +193,6 @@ jobs:
         run: |
           python - <<'PY'
           import sys; sys.path.append("src")
-          # Prefer AI governor if present
           try:
               from pipeline_ai import ai_hourly
               print(ai_hourly(top_k=5))
@@ -256,6 +234,18 @@ jobs:
               print("ai_weekly failed, fallback to pipeline.weekly_run:", e)
               from pipeline import weekly_run
               print(weekly_run())
+          PY
+
+      - name: Nightly AutoML
+        if: github.event.schedule == '30 20 * * 1-5'
+        run: |
+          python - <<'PY'
+          import sys; sys.path.append("src")
+          try:
+              from pipeline_ai import ai_nightly_automl
+              print(ai_nightly_automl())
+          except Exception as e:
+              print("ai_nightly_automl failed:", e)
           PY
 
       - name: Upload reports artifact
