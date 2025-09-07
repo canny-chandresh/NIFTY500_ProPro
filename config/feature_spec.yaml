@@ -1,10 +1,31 @@
-features:
-  - name: r_5
-    expr: "pct_change(close, 5)"
-    clip: [-0.2, 0.2]
-    zscore_window: 120
-  - name: atr_norm
-    expr: "atr(high, low, close, 14)"
-    clip: [0, 0.2]
-    zscore_window: 120
-targets: []
+# feature_spec.yaml
+core:
+  - ret1d       # 1-day returns
+  - vol_20d     # 20-day volatility
+  - atr_14
+  - ema_20
+  - ema_200
+  - gap_up
+  - gap_down
+
+options:
+  - iv          # implied volatility
+  - oi          # open interest
+  - put_call_ratio
+  - vol_surface_fit
+
+sector:
+  - sector_momentum
+  - sector_breadth
+
+graph:
+  - centrality_degree
+  - centrality_betweenness
+
+dl_shadow:
+  - transformer_score
+  - gnn_score
+
+auto_features:
+  promote_threshold: 0.01
+  max_promotions_per_week: 3
