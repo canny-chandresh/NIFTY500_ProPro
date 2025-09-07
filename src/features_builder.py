@@ -1,104 +1,110 @@
+# src/features_builder.py
 from __future__ import annotations
-import pandas as pd, numpy as np
-import yaml, os, datetime as dt
+import pandas as pd, numpy as np, yaml
 from pathlib import Path
 
 DL = Path("datalake")
+PER = DL / "per_symbol"
+OUT_DIR = DL / "features"
+AUTO_DIR = DL / "features_auto"
 SPEC = Path("config/feature_spec.yaml")
-OUT_DIR = Path("datalake/features")
+PROM = Path("config/promoted_features.yaml")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-def pct_change(series, n):
-    return series.pct_change(n)
-
+# ------- basic primitives (extend as needed)
+def pct_change(series, n): return series.pct_change(n)
 def atr(high, low, close, n=14):
-    tr = np.maximum.reduce([
-        high - low,
-        (high - close.shift()).abs(),
-        (low - close.shift()).abs()
-    ])
+    tr = np.maximum.reduce([high-low, (high-close.shift()).abs(), (low-close.shift()).abs()])
     return tr.rolling(n).mean()
+def slope(series, window=10): return series.diff(window) / (window + 1e-9)
+def rolling_beta(x, y, n=60): return x.rolling(n).cov(y) / (y.rolling(n).var()+1e-9)
 
-def slope(series, window=10):
-    return (series.diff(window) / window)
+def _load_yaml(p: Path, default: dict) -> dict:
+    if not p.exists(): return default
+    return yaml.safe_load(p.read_text())
 
-def rolling_beta(x, y, n=60):
-    cov = x.rolling(n).cov(y)
-    var = y.rolling(n).var()
-    return cov / var
+def _winsorize(s: pd.Series, lo=-3.0, hi=3.0):  # zscore or pct bounds later
+    ql, qh = s.quantile(0.01), s.quantile(0.99)
+    return s.clip(ql, qh)
 
-def build_matrix(symbol: str, spec_path: Path = SPEC) -> pd.DataFrame:
-    """Build feature + target matrix for one symbol from YAML spec."""
-    f = DL / f"per_symbol/{symbol}.csv"
-    if not f.exists():
-        raise FileNotFoundError(f"missing {f}")
+def _zscore(s: pd.Series, w: int): 
+    m = s.rolling(w).mean(); v = s.rolling(w).std()
+    return (s - m) / (v + 1e-9)
 
-    df = pd.read_csv(f, parse_dates=["Date"])
-    df = df.sort_values("Date").reset_index(drop=True)
+def _compute_feature(df: pd.DataFrame, feat: dict) -> pd.Series:
+    expr = feat["expr"].lower()
+    if expr.startswith("pct_change"):
+        n = int(expr.split(",")[-1].strip(" )"))
+        return pct_change(df["Close"], n)
+    if expr.startswith("atr(") or "atr(" in expr:
+        return atr(df["High"], df["Low"], df["Close"], 14) / df["Close"]
+    if expr.startswith("ema("):
+        n = int(expr.split(",")[1].strip(" )"))
+        ema = df["Close"].ewm(span=n).mean()
+        return slope(ema, 10)
+    if "gap" in expr:
+        prev = df["Close"].shift(1)
+        return (df["Open"] - prev) / (atr(df["High"], df["Low"], df["Close"],14) + 1e-9)
+    if "rolling_beta" in expr:
+        # stub; requires index return column; skip if absent
+        if "nifty_ret_1" not in df.columns or "ret_1" not in df.columns:
+            return pd.Series(index=df.index, dtype=float)
+        return rolling_beta(df["ret_1"], df["nifty_ret_1"], 60)
+    if "news_sentiment_score" in expr and "news_sentiment_score" in df.columns:
+        return df["news_sentiment_score"]
+    return pd.Series(index=df.index, dtype=float)
 
-    spec = yaml.safe_load(spec_path.read_text())
-    features, targets = spec.get("features", []), spec.get("targets", [])
+def build_matrix(symbol: str) -> pd.DataFrame:
+    f = PER / f"{symbol}.csv"
+    if not f.exists(): raise FileNotFoundError(f)
+    df = pd.read_csv(f, parse_dates=["Date"]).sort_values("Date").reset_index(drop=True)
 
-    # compute features
-    for feat in features:
-        name = feat["name"]
-        expr = feat["expr"]
-        try:
-            if "pct_change" in expr:
-                n = int(expr.split(",")[-1].strip(") "))
-                df[name] = pct_change(df["Close"], n)
-            elif "atr" in expr:
-                df[name] = atr(df["High"], df["Low"], df["Close"], 14) / df["Close"]
-            elif "ema" in expr:
-                n = int(expr.split(",")[1].strip(") "))
-                df[name] = df["Close"].ewm(span=n).mean()
-                df[name+"_slope"] = slope(df[name], 10)
-            elif "gap_open_atr" in expr:
-                df[name] = (df["Open"] - df["Close"].shift()) / atr(df["High"], df["Low"], df["Close"])
-            # extend with more as needed
-        except Exception as e:
-            df[name] = np.nan
-            print(f"[features_builder] error {name}: {e}")
+    spec = _load_yaml(SPEC, {"features": [], "targets": []})
+    feats = spec.get("features", [])
+    out = pd.DataFrame({"Date": df["Date"].values})
 
-        # Winsorize / normalize
-        if "clip" in feat:
-            lo, hi = feat["clip"]
-            df[name] = df[name].clip(lo, hi)
+    # manual features
+    for feat in feats:
+        name = feat["name"]; s = _compute_feature(df, feat)
+        if "clip" in feat and isinstance(feat["clip"], list) and len(feat["clip"])==2:
+            s = s.clip(feat["clip"][0], feat["clip"][1])
         if "zscore_window" in feat:
-            roll = df[name].rolling(feat["zscore_window"])
-            df[name] = (df[name] - roll.mean()) / (roll.std() + 1e-9)
+            s = _zscore(s, int(feat["zscore_window"]))
+        out[name] = s
+        out[name + "_is_missing"] = out[name].isna().astype(int)
 
-        # missing flags
-        miss_flag = name + "_is_missing"
-        df[miss_flag] = df[name].isna().astype(int)
+    # promoted AUTO features (per-symbol)
+    prom = _load_yaml(PROM, {"auto_features": []}).get("auto_features", [])
+    auto_p = AUTO_DIR / f"{symbol}_auto.csv"
+    if auto_p.exists() and prom:
+        auto_df = pd.read_csv(auto_p, parse_dates=["Date"])
+        for item in prom:
+            src = item.get("source","")
+            if not src.startswith("AUTO::"): continue
+            col = src.split("AUTO::",1)[1]
+            if col in auto_df.columns:
+                out[item["name"]] = auto_df[col]
+                out[item["name"] + "_is_missing"] = out[item["name"]].isna().astype(int)
 
-    # compute targets
-    for targ in targets:
-        name = targ["name"]
-        horizon = targ["expr"].split("horizon=")[-1].split(",")[0].replace("m","").replace("d","").strip()
-        horizon = 15 if horizon=="15" else 60 if horizon=="60" else 1
-        # dummy target: next-day return
-        df[name] = df["Close"].shift(-1) / df["Close"] - 1
+    # targets: basic safe placeholder (1d forward return)
+    if "Close" in df.columns:
+        out["y_1d"] = df["Close"].shift(-1) / df["Close"] - 1
 
-    # drop NaN rows from lookaheads
-    df = df.dropna().reset_index(drop=True)
+    # final clean
+    out = out.dropna().reset_index(drop=True)
+    (OUT_DIR / f"{symbol}_features.csv").write_text(out.to_csv(index=False), encoding="utf-8")
+    return out
 
-    out = OUT_DIR / f"{symbol}_features.csv"
-    df.to_csv(out, index=False)
-    return df
-
-def build_all():
-    per_symbol = DL / "per_symbol"
-    if not per_symbol.exists():
-        print("No per_symbol folder.")
-        return
-    for csv in per_symbol.glob("*.csv"):
-        sym = csv.stem
+def build_all(limit: int | None = None) -> dict:
+    files = list(PER.glob("*.csv"))
+    if limit: files = files[:limit]
+    ok, fail = 0, 0
+    for p in files:
         try:
-            df = build_matrix(sym)
-            print(f"built {sym}, {len(df)} rows")
-        except Exception as e:
-            print(f"error {sym}: {e}")
+            build_matrix(p.stem); ok += 1
+        except Exception:
+            fail += 1
+    return {"built": ok, "failed": fail}
 
 if __name__ == "__main__":
-    build_all()
+    print(build_all())
