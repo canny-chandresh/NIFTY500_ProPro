@@ -1,15 +1,39 @@
 # src/model_selector.py
-from engine_registry import get_engine
+from __future__ import annotations
+import importlib
 import pandas as pd
+from typing import Dict
 
-def run_engines(train_df, pred_df, cfg):
-    names = cfg.get("engines_active",["ML_ROBUST","DL_TEMPORAL","ALGO_RULES","AUTO_TOPK","UFD_PROMOTED"])
-    outputs=[]
-    for name in names:
-        eng=get_engine(name)
-        if not eng: continue
-        model=eng["train"](train_df,cfg)
-        out=eng["predict"](model,pred_df,cfg)
-        out["engine"]=name
-        outputs.append(out)
-    return pd.concat(outputs,ignore_index=True)
+# Ensure engines are imported so they self-register
+_ENGINE_MODULES = [
+    "engine_ml_robust",
+    "engine_algo_rules",
+    "engine_auto",
+    "engine_ufd",
+    "engine_dl_temporal",
+    "engine_dl_transformer",
+    "engine_gnn",
+    "engine_lstm",
+]
+
+for m in _ENGINE_MODULES:
+    try:
+        importlib.import_module(m)
+    except Exception as e:
+        print(f"[model_selector] optional engine '{m}' not loaded: {e}")
+
+from engine_registry import run_engine
+
+def run_engines(train_df: pd.DataFrame, pred_df: pd.DataFrame, cfg: Dict) -> pd.DataFrame:
+    active = cfg.get("engines_active") or []
+    frames = []
+    for name in active:
+        try:
+            df = run_engine(name, train_df, pred_df, cfg)
+            if not df.empty:
+                frames.append(df)
+        except Exception as e:
+            print(f"[model_selector] engine {name} failed: {e}")
+    if not frames:
+        return pd.DataFrame(columns=["symbol","Score","WinProb","Reason","engine"])
+    return pd.concat(frames, ignore_index=True)
