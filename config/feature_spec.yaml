@@ -1,31 +1,51 @@
-# feature_spec.yaml
+# config/feature_spec.yaml
+# Declarative spec of the features you *intend* to train on.
+# The validator will:
+#  - ensure required keys exist (symbol, freq, asof_ts, etc.)
+#  - check that listed features are present
+#  - flag any unexpected features (not in allowlists)
+#  - allow AUTO_* promotions within caps
+meta:
+  required_keys:
+    - symbol
+    - freq
+    - asof_ts
+    - regime_flag
+    - live_source_equity
+    - live_source_options
+    - is_synth_options
+    - data_age_min
+    - y_1d
+
+namespaces:
+  # Allow these prefixes freely (and their *_is_missing masks)
+  allow_prefixes:
+    - MAN_
+    - AUTO_
+    - GRAPH_
+    - OPT_
+
+caps:
+  max_total_features: 400
+  max_auto_features: 120
+
 core:
-  - ret1d       # 1-day returns
-  - vol_20d     # 20-day volatility
-  - atr_14
-  - ema_20
-  - ema_200
-  - gap_up
-  - gap_down
-
-options:
-  - iv          # implied volatility
-  - oi          # open interest
-  - put_call_ratio
-  - vol_surface_fit
-
-sector:
-  - sector_momentum
-  - sector_breadth
+  must_have:
+    - MAN_ret1
+    - MAN_atr14
+    - MAN_ema20slope
 
 graph:
-  - centrality_degree
-  - centrality_betweenness
+  should_have:
+    - GRAPH_deg
+    - GRAPH_btw
 
-dl_shadow:
-  - transformer_score
-  - gnn_score
+options:
+  optional:
+    - OPT_iv
+    - OPT_oi
+    - OPT_pcr
 
-auto_features:
-  promote_threshold: 0.01
-  max_promotions_per_week: 3
+drift:
+  psi_warn: 0.2
+  psi_fail: 0.3
