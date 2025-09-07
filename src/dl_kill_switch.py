@@ -1,74 +1,64 @@
+# src/dl_kill_switch.py
 from __future__ import annotations
-import os, json, datetime as dt
-from typing import Dict
-from config import CONFIG
+import json, datetime as dt
+from pathlib import Path
+from typing import Dict, Any
 
-STATE_PATH = "reports/shadow/dl_kill_state.json"
+STATE = Path("reports/metrics/dl_kill_state.json")
+STATE.parent.mkdir(parents=True, exist_ok=True)
 
-def _read() -> Dict:
-    if os.path.exists(STATE_PATH):
-        try: return json.load(open(STATE_PATH))
+DEFAULT_CFG = {
+    "enabled": True,
+    "lookback_runs": 3,        # consecutive runs to evaluate
+    "min_winrate_pct": 30.0,   # floor; below this -> count a failure
+    "cooldown_runs": 4         # pause DL training for these many runs after trip
+}
+
+def _load_state() -> Dict[str, Any]:
+    if STATE.exists():
+        try: return json.loads(STATE.read_text())
         except Exception: pass
-    return {"history": [], "suspended_until": None}
+    return {"history": [], "cooldown_left": 0, "tripped": False}
 
-def _write(obj: Dict):
-    os.makedirs(os.path.dirname(STATE_PATH) or ".", exist_ok=True)
-    json.dump(obj, open(STATE_PATH,"w"), indent=2)
+def _save_state(s: Dict[str, Any]) -> None:
+    s["updated_utc"] = dt.datetime.utcnow().isoformat() + "Z"
+    STATE.write_text(json.dumps(s, indent=2), encoding="utf-8")
 
-def update_from_eval(eval_res: Dict):
-    """Call after each dl eval run."""
-    st = _read()
-    thr = CONFIG["dl"]["kill_switch"]
-    now = dt.datetime.utcnow()
+def should_train_dl(cfg: Dict[str, Any] = None) -> tuple[bool, Dict[str, Any]]:
+    cfg = {**DEFAULT_CFG, **(cfg or {})}
+    st = _load_state()
 
-    # record
-    rec = {
-        "when_utc": eval_res.get("when_utc"),
-        "hit_rate": eval_res.get("hit_rate"),
-        "n_test":   eval_res.get("n_test"),
-        "status":   eval_res.get("status","ok")
-    }
-    st["history"] = (st.get("history") or []) + [rec]
-    st["history"] = st["history"][-(thr["window_runs"]*2):]  # keep recent
+    # respect cooldown
+    if st.get("cooldown_left", 0) > 0:
+        st["cooldown_left"] = max(0, int(st["cooldown_left"]) - 1)
+        _save_state(st)
+        return False, {"reason": "cooldown", "cooldown_left": st["cooldown_left"]}
 
-    # compute window stats
-    window = st["history"][-thr["window_runs"]:]
-    bad_runs = [r for r in window if (r.get("n_test",0) >= thr["min_test"]) and (r.get("hit_rate",1.0) < thr["hit_rate_floor"])]
-    consec_bad = 0
-    for r in reversed(window):
-        if r.get("n_test",0) >= thr["min_test"] and r.get("hit_rate",1.0) < thr["hit_rate_floor"]:
-            consec_bad += 1
-        else:
-            break
+    # if never tripped or not enough history, allow training
+    hist = st.get("history", [])[-cfg["lookback_runs"]:]
+    if len(hist) < cfg["lookback_runs"]:
+        return True, {"reason": "warming", "have": len(hist), "need": cfg["lookback_runs"]}
 
-    # decide suspension
-    suspended_until = st.get("suspended_until")
-    if consec_bad >= thr["consec_bad"] or len(bad_runs) >= (thr["window_runs"]//2 + 1):
-        until = now + dt.timedelta(hours=thr["cooloff_hours"])
-        st["suspended_until"] = until.isoformat()+"Z"
-    else:
-        # auto-clear if past cooloff
-        if suspended_until:
-            try:
-                t = dt.datetime.fromisoformat(suspended_until.replace("Z",""))
-                if now > t:
-                    st["suspended_until"] = None
-            except Exception:
-                st["suspended_until"] = None
+    # evaluate last N runs
+    fails = sum(1 for h in hist if (h or {}).get("win_rate", 100.0) < cfg["min_winrate_pct"])
+    if fails >= cfg["lookback_runs"]:
+        # trip kill switch
+        st["tripped"] = True
+        st["cooldown_left"] = int(cfg["cooldown_runs"])
+        _save_state(st)
+        return False, {"reason": "tripped", "fails": fails, "cooldown_left": st["cooldown_left"]}
 
-    _write(st)
-    return st
+    return True, {"reason": "ok", "fails_in_window": fails}
 
-def status() -> Dict:
-    st = _read()
-    now = dt.datetime.utcnow()
-    susp = st.get("suspended_until")
-    active = True
-    if susp:
-        try:
-            t = dt.datetime.fromisoformat(susp.replace("Z",""))
-            if now <= t: active = False
-        except Exception:
-            st["suspended_until"] = None
-    st["active"] = active
-    return st
+def record_result(win_rate_pct: float, cfg: Dict[str, Any] = None) -> Dict[str, Any]:
+    cfg = {**DEFAULT_CFG, **(cfg or {})}
+    st = _load_state()
+    hist = st.get("history", [])
+    hist.append({"when_utc": dt.datetime.utcnow().isoformat()+"Z", "win_rate": float(win_rate_pct)})
+    # keep last 20 results
+    st["history"] = hist[-20:]
+    # if performing well, clear trip state
+    if win_rate_pct >= cfg["min_winrate_pct"]:
+        st["tripped"] = False
+    _save_state(st)
+    return {"history_len": len(st["history"]), "tripped": st.get("tripped", False), "cooldown_left": st.get("cooldown_left", 0)}
