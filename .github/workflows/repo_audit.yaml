@@ -1,0 +1,149 @@
+name: Repo Audit (one-click)
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install minimal deps (non-fatal)
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
+          pip install pandas numpy pyyaml || true
+
+      - name: Show tree (2 levels)
+        run: |
+          echo "== REPO ROOT ==" && ls -la
+          echo "== .github/workflows ==" && ls -la .github/workflows || true
+          echo "== src ==" && ls -la src || true
+          echo "== config ==" && ls -la config || true
+          echo "== datalake ==" && ls -la datalake || true
+          echo "== datalake/features ==" && ls -la datalake/features || true
+
+      - name: Run audit
+        run: |
+          python - <<'PY'
+          import os, sys, json, glob, importlib, traceback
+          from pathlib import Path
+          sys.path.append("src")
+
+          expected = {
+            "root": [
+              ".github/workflows/hourly.yaml",
+              "requirements.txt",
+            ],
+            "config": [
+              "config/feature_spec.yaml"
+            ],
+            "src": [
+              # orchestrators
+              "src/pipeline.py",
+              "src/pipeline_ai.py",
+              "src/model_selector.py",
+              "src/engine_registry.py",
+              "src/config.py",
+              # engines
+              "src/engine_ml_robust.py",
+              "src/engine_algo_rules.py",
+              "src/engine_auto.py",
+              "src/engine_ufd.py",
+              "src/engine_dl_temporal.py",
+              "src/engine_dl_transformer.py",
+              "src/engine_gnn.py",
+              "src/engine_lstm.py",
+              # infra/aux
+              "src/_engine_utils.py",
+              "src/feature_spec.py",
+              "src/report_eod.py",
+              "src/telegram.py",
+              "src/hygiene_checks.py",
+              "src/live_equity_alt.py",
+              "src/options_live_multi.py",
+              "src/news_ingest.py",
+              "src/fii_flows_live.py",
+              "src/utils_time.py",
+              "src/regime.py",
+              "src/risk_engine_v2.py",
+              "src/entrypoints.py",
+            ],
+          }
+
+          def exists(path):
+            return Path(path).exists()
+
+          missing = []
+          for group, files in expected.items():
+            for f in files:
+              if not exists(f):
+                missing.append(f)
+
+          # try importing critical modules
+          imports = ["pipeline","pipeline_ai","model_selector","engine_registry",
+                     "engine_ml_robust","engine_algo_rules","engine_auto","engine_ufd",
+                     "engine_dl_temporal","engine_dl_transformer","engine_gnn","engine_lstm",
+                     "feature_spec","report_eod","telegram","hygiene_checks",
+                     "live_equity_alt","options_live_multi","news_ingest","fii_flows_live",
+                     "utils_time","regime","risk_engine_v2","entrypoints","config"]
+          import_errors = {}
+          for m in imports:
+            try:
+              importlib.import_module(m)
+            except Exception as e:
+              import_errors[m] = repr(e)
+
+          # list engines registered (if registry loaded)
+          engines = []
+          try:
+            from engine_registry import list_engines
+            engines = list_engines()
+          except Exception:
+            pass
+
+          # check features directory presence
+          features_files = sorted(glob.glob("datalake/features/*_features.csv"))
+          per_symbol_files = sorted(glob.glob("datalake/per_symbol/*.csv"))
+
+          out = {
+            "missing_files": missing,
+            "import_errors": import_errors,
+            "engines_discovered": engines,
+            "counts": {
+              "features_csv": len(features_files),
+              "per_symbol_csv": len(per_symbol_files),
+            },
+          }
+
+          Path("reports").mkdir(parents=True, exist_ok=True)
+          Path("reports/audit").mkdir(parents=True, exist_ok=True)
+          (Path("reports/audit/repo_audit.json")).write_text(json.dumps(out, indent=2), encoding="utf-8")
+
+          print("=== AUDIT RESULT ===")
+          print(json.dumps(out, indent=2))
+          PY
+
+      - name: Save tree.txt
+        run: |
+          sudo apt-get update -y >/dev/null 2>&1 || true
+          sudo apt-get install -y tree >/dev/null 2>&1 || true
+          tree -L 3 -a > tree.txt || true
+
+      - name: Upload audit artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: repo_audit
+          path: |
+            tree.txt
+            reports/audit/repo_audit.json
+          if-no-files-found: warn
