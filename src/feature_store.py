@@ -1,92 +1,96 @@
 # src/feature_store.py
 from __future__ import annotations
-import os, json, hashlib, datetime as dt
+import json
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, Optional, List
+
 import pandas as pd
 
-CFG = {
-    "root": "datalake/feature_store",
-    "manifests": "datalake/feature_store/_manifests",
-    "partitions": ["symbol", "freq"],  # partition by symbol + frequency
-    "hash_cols": None,  # if None, hash all columns
-    "retention_days": 730,  # keep ~24 months by default
-}
+try:
+    import yaml
+    YAML_OK = True
+except Exception:
+    YAML_OK = False
 
-ROOT  = Path(CFG["root"])
-MNFS  = Path(CFG["manifests"])
-ROOT.mkdir(parents=True, exist_ok=True)
-MNFS.mkdir(parents=True, exist_ok=True)
+try:
+    import pyarrow as pa  # noqa: F401
+    import pyarrow.parquet as pq  # noqa: F401
+    ARROW_OK = True
+except Exception:
+    ARROW_OK = False
 
-def _hash_df(df: pd.DataFrame, cols: Optional[List[str]] = None) -> str:
-    if cols is None: cols = list(df.columns)
-    hx = hashlib.sha256(pd.util.hash_pandas_object(df[cols], index=False).values.tobytes()).hexdigest()
-    return hx
+def _root(cfg: Dict) -> Path:
+    return Path(cfg.get("paths", {}).get("feature_store", "datalake/feature_store"))
 
-def put(symbol: str, freq: str, df: pd.DataFrame, kind: str = "features", meta: Dict = None) -> Dict:
-    """
-    Write a dataframe to the store as parquet:
-      datalake/feature_store/kind=features/symbol=SBIN/freq=1d/date=YYYY-MM-DD.parquet
-    Also write/update a manifest json with hash + row count.
-    """
-    if df is None or df.empty:
-        return {"ok": False, "reason": "empty"}
+def _meta_dir(root: Path) -> Path:
+    d = root / "_meta"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
-    # Require a Date/timestamp column
-    date_col = "Date" if "Date" in df.columns else ("date" if "date" in df.columns else None)
-    if not date_col:
-        return {"ok": False, "reason": "no Date column"}
-
-    df = df.sort_values(date_col).reset_index(drop=True)
-    # daily partition by last date present
-    last_day = pd.to_datetime(df[date_col].iloc[-1]).date().isoformat()
-
-    # Build path
-    base = ROOT / f"kind={kind}" / f"symbol={symbol}" / f"freq={freq}" / f"date={last_day}"
-    base.mkdir(parents=True, exist_ok=True)
-    fpath = base / "data.parquet"
-
-    # Write parquet
-    df.to_parquet(fpath, index=False)
-
-    # Manifest
-    h = _hash_df(df, CFG["hash_cols"])
-    m = {
-        "kind": kind, "symbol": symbol, "freq": freq, "date": last_day,
-        "rows": int(len(df)), "cols": list(df.columns),
-        "hash": h, "meta": meta or {}, "written_utc": dt.datetime.utcnow().isoformat()+"Z"
+def write_features(cfg: Dict, df: pd.DataFrame, symbol: str, version: str = "v1") -> Path:
+    root = _root(cfg)
+    root.mkdir(parents=True, exist_ok=True)
+    fpath = root / f"{symbol}_{version}.parquet"
+    if ARROW_OK:
+        df.to_parquet(fpath, index=False)
+    else:
+        # fallback
+        fpath = root / f"{symbol}_{version}.csv"
+        df.to_csv(fpath, index=False)
+    # write meta
+    meta = {
+        "symbol": symbol,
+        "version": version,
+        "rows": int(len(df)),
+        "columns": list(map(str, df.columns)),
     }
-    (MNFS / f"{kind}__{symbol}__{freq}__{last_day}.json").write_text(json.dumps(m, indent=2), encoding="utf-8")
+    mdir = _meta_dir(root)
+    if YAML_OK:
+        (mdir / f"{symbol}_{version}.yaml").write_text(
+            yaml.safe_dump(meta, sort_keys=False), encoding="utf-8"
+        )
+    else:
+        (mdir / f"{symbol}_{version}.json").write_text(
+            json.dumps(meta, indent=2), encoding="utf-8"
+        )
+    return fpath
 
-    return {"ok": True, "path": str(fpath), "manifest": str((MNFS / f"{kind}__{symbol}__{freq}__{last_day}.json"))}
-
-def latest(symbol: str, freq: str, kind: str = "features") -> Optional[pd.DataFrame]:
-    """Load latest partition for a symbol/freq & kind."""
-    base = ROOT / f"kind={kind}" / f"symbol={symbol}" / f"freq={freq}"
-    if not base.exists(): return None
-    dates = sorted([p.name.split("=")[-1] for p in base.glob("date=*")])
-    if not dates: return None
-    fpath = base / f"date={dates[-1]}" / "data.parquet"
-    if not fpath.exists(): return None
-    return pd.read_parquet(fpath)
-
-def vacuum(retention_days: int = None) -> Dict:
-    """Remove old partitions beyond retention_days. Non-fatal."""
-    keep_days = int(CFG.get("retention_days")) if retention_days is None else int(retention_days)
-    cutoff = dt.datetime.utcnow().date() - dt.timedelta(days=keep_days)
-    removed = 0
-    for p in ROOT.glob("kind=*/*/*/date=*"):
+def load_latest(cfg: Dict, symbol: str) -> Optional[pd.DataFrame]:
+    root = _root(cfg)
+    # prefer parquet
+    for p in sorted(root.glob(f"{symbol}_*.parquet"), reverse=True):
         try:
-            d = dt.date.fromisoformat(p.name.split("=")[-1])
-            if d < cutoff:
-                for f in p.glob("*"): f.unlink(missing_ok=True)
-                p.rmdir()
-                removed += 1
+            return pd.read_parquet(p)
         except Exception:
-            pass
-    return {"removed": removed, "cutoff": cutoff.isoformat()}
+            continue
+    for p in sorted(root.glob(f"{symbol}_*.csv"), reverse=True):
+        try:
+            return pd.read_csv(p)
+        except Exception:
+            continue
+    return None
 
-def list_symbols(kind: str = "features") -> List[str]:
-    base = ROOT / f"kind={kind}"
-    if not base.exists(): return []
-    return [p.name.split("=")[-1] for p in base.glob("symbol=*")]
+def list_available(cfg: Dict) -> List[str]:
+    root = _root(cfg)
+    syms = set()
+    for p in root.glob("*.parquet"):
+        syms.add(p.name.split("_")[0])
+    for p in root.glob("*.csv"):
+        syms.add(p.name.split("_")[0])
+    return sorted(syms)
+
+def validate_schema(cfg: Dict, required_cols: List[str]) -> Dict:
+    root = _root(cfg)
+    bad = []
+    for sym in list_available(cfg):
+        df = load_latest(cfg, sym)
+        if df is None:
+            bad.append({"symbol": sym, "error": "load_failed"})
+            continue
+        missing = [c for c in required_cols if c not in df.columns]
+        if missing:
+            bad.append({"symbol": sym, "missing": missing})
+    rep = Path(cfg.get("paths", {}).get("reports", "reports")) / "hygiene"
+    rep.mkdir(parents=True, exist_ok=True)
+    (rep / "feature_store_validate.json").write_text(json.dumps({"bad": bad}, indent=2), encoding="utf-8")
+    return {"bad": bad, "count": len(bad)}
