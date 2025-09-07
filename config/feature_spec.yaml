@@ -1,0 +1,51 @@
+# config/feature_spec.yaml
+# Declarative spec of the features you *intend* to train on.
+# The validator will:
+#  - ensure required keys exist (symbol, freq, asof_ts, etc.)
+#  - check that listed features are present
+#  - flag any unexpected features (not in allowlists)
+#  - allow AUTO_* promotions within caps
+meta:
+  required_keys:
+    - symbol
+    - freq
+    - asof_ts
+    - regime_flag
+    - live_source_equity
+    - live_source_options
+    - is_synth_options
+    - data_age_min
+    - y_1d
+
+namespaces:
+  # Allow these prefixes freely (and their *_is_missing masks)
+  allow_prefixes:
+    - MAN_
+    - AUTO_
+    - GRAPH_
+    - OPT_
+
+caps:
+  max_total_features: 400
+  max_auto_features: 120
+
+core:
+  must_have:
+    - MAN_ret1
+    - MAN_atr14
+    - MAN_ema20slope
+
+graph:
+  should_have:
+    - GRAPH_deg
+    - GRAPH_btw
+
+options:
+  optional:
+    - OPT_iv
+    - OPT_oi
+    - OPT_pcr
+
+drift:
+  psi_warn: 0.2
+  psi_fail: 0.3
