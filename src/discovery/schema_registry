@@ -1,0 +1,30 @@
+# -*- coding: utf-8 -*-
+"""
+Safely promotes candidate features into feature_spec.yaml (with backup).
+"""
+
+from __future__ import annotations
+from pathlib import Path
+import shutil, yaml, datetime as dt
+from typing import List
+from config import CONFIG
+
+SPEC = Path(CONFIG["feature_spec_file"])
+BACKUP_DIR = SPEC.parent / "backups"
+BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+
+def _load_spec() -> dict:
+    if not SPEC.exists(): return {"keep":[]}
+    return yaml.safe_load(SPEC.read_text()) or {"keep":[]}
+
+def _save_spec(spec: dict):
+    SPEC.write_text(yaml.safe_dump(spec, sort_keys=False))
+
+def promote(new_cols: List[str]) -> str:
+    spec = _load_spec()
+    keep = list(dict.fromkeys([*spec.get("keep",[]), *new_cols]))
+    spec["keep"] = keep
+    ts = dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    shutil.copy2(SPEC, BACKUP_DIR/f"feature_spec_{ts}.yaml") if SPEC.exists() else None
+    _save_spec(spec)
+    return str(SPEC)
