@@ -1,140 +1,177 @@
-# src/entrypoints.py
+# -*- coding: utf-8 -*-
+"""
+entrypoints.py
+Top-level orchestration for hourly (3:15 picks), EOD, and periodic reports.
+Phase-1 is robust to missing Phase-2 modules (imports wrapped in try/except).
+"""
+
 from __future__ import annotations
-import os, json, datetime as dt
-import pandas as pd
+import os, sys, json, traceback, datetime as dt
+from pathlib import Path
+from typing import Dict, Any, List
 
-from error_logger import RunLogger
-from locks import RunLock
-from market_hours import should_run_hourly, is_preopen_window, is_eod_window
-from metrics_tracker import summarize_last_n
-from archiver import run_archiver
-from backtester import backtest_trades
+from config import CONFIG
+import telegram as tg
 
-# Telegram fallbacks
-try:
-    from telegram import send_text, send_stats
-except Exception:
-    def send_text(msg: str): print("[TELEGRAM Fallback]\n"+msg)
-    def send_stats(stats: dict, title: str="Summary"):
-        print("[TELEGRAM Fallback] "+title); print(stats)
+# Optional modules (safe imports)
+def _try_import(name: str):
+    try:
+        return __import__(name, fromlist=["*"])
+    except Exception:
+        return None
 
-# Pipeline runner (AUTO + ALGO)
-try:
-    from pipeline_ai import run_auto_and_algo_sessions
-except Exception:
-    def run_auto_and_algo_sessions(*a, **k):
-        print("[PIPELINE Fallback] run_auto_and_algo_sessions not available")
-        return 0, 0
+feature_store = _try_import("feature_store")
+matrix        = _try_import("matrix")
+engine_guard  = _try_import("engine_guard")
+pipeline_ai   = _try_import("pipeline_ai")
+report_eod    = _try_import("report_eod")
+report_period = _try_import("report_periodic")
 
-DL = "datalake"
+alpha_runtime = _try_import("alpha.runtime")  # may be None in Phase-1
 
-def _stamp() -> str:
-    return dt.datetime.utcnow().replace(microsecond=0).isoformat()+"Z"
+# ---------- Utilities ----------
 
-# ----------------- Pre-open / Daily update -----------------
+def _now_ist():
+    # IST = UTC+5:30
+    return dt.datetime.utcnow() + dt.timedelta(hours=5, minutes=30)
 
-def daily_update(preopen: bool=False):
-    """
-    Lightweight prep. If preopen=True (first run before open), it just warms up and pings TG.
-    """
-    label = "preopen" if preopen else "daily_update"
-    logger = RunLogger(label=label)
-    with logger.capture_all(label, swallow=True):
-        note = {"when_utc": _stamp(), "phase": label}
-        os.makedirs("reports/metrics", exist_ok=True)
-        with open(f"reports/metrics/{label}.json","w", encoding="utf-8") as f:
-            json.dump(note, f, indent=2)
-        send_text("⏰ Pre-open warm-up complete." if preopen else "🔁 Daily update done.")
-    logger.dump()
+def _in_window(hh: int, mm: int, win_min: int) -> bool:
+    now = _now_ist()
+    tgt = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    delta = abs((now - tgt).total_seconds()) / 60.0
+    return delta <= float(win_min)
 
-# ----------------- Main recommendation session -----------------
+def _time_gated_315pm() -> bool:
+    n = CONFIG.get("notify", {})
+    if n.get("force_every_run", False):
+        return True
+    if not n.get("send_only_at_ist", True):
+        return True
+    return _in_window(n.get("ist_send_hour",15), n.get("ist_send_min",15), n.get("window_min",3))
 
-def run_paper_session(top_k: int = 5):
-    """
-    Hourly recommendation pass with market-hours gating & idempotency lock.
-    """
-    # Gate: only during trading hours (IST) — allow if preopen/eod windows
-    if not (should_run_hourly() or is_preopen_window() or is_eod_window()):
-        print("[gate] Outside trading window; skipping.")
-        return
+def _engine_presence_flags() -> dict:
+    """Filesystem checks for trained artifacts (used in footer)."""
+    base = Path(CONFIG["paths"]["datalake"]) / "features_runtime"
+    def ex(p): return (base/p).exists()
+    def any_in(p): return (Path(CONFIG["paths"]["datalake"])/p).exists()
+    return {
+        "booster": ex(Path("boosters")/"xgb.json") or ex(Path("boosters")/"cat.cbm"),
+        "dl_ft":   ex(Path("dl_ft")/"ft_transformer.pt"),
+        "dl_tcn":  ex(Path("dl_tcn")/"tcn.pt") and any_in("intraday/5m"),
+        "dl_tst":  ex(Path("dl_tst")/"tst.pt") and any_in("intraday/5m"),
+        "calib":   ex(Path("calibration")/"platt.json") or ex(Path("calibration")/"isotonic.json"),
+        "stacker": ex(Path("meta")/"stacker.json"),
+    }
 
-    logger = RunLogger(label="reco_session")
-    with logger.capture_all("reco_session", swallow=True):
+def _engine_footer(guard_obj: dict | None = None) -> str:
+    ticks = lambda b: "✔" if b else "⚠"
+    g = guard_obj.get("engines_active", {}) if isinstance(guard_obj, dict) else {}
+    fs = _engine_presence_flags()
+    footer = [
+        f"ML {ticks(True)}",
+        f"Boost {ticks(g.get('booster', fs['booster']))}",
+        f"FT {ticks(g.get('dl_ft', fs['dl_ft']))}",
+        f"TCN {ticks(g.get('dl_tcn', fs['dl_tcn']))}",
+        f"TST {ticks(fs['dl_tst'])}",
+        f"Calib {ticks(fs['calib'])}",
+        f"Stacker {ticks(fs['stacker'])}",
+    ]
+    return "Engines: " + " • ".join(footer)
+
+# ---------- Core flows ----------
+
+def daily_update() -> Dict[str, Any]:
+    """Light maintenance hook; safe to keep as no-op in Phase-1."""
+    out = {"ok": True, "ts": dt.datetime.utcnow().isoformat()+"Z"}
+    # Phase-2 can add: refresh_daily_equity/macro; quick validations, etc.
+    return out
+
+def hourly_live_or_paper(top_k: int = 5) -> Dict[str, Any]:
+    res: Dict[str, Any] = {"ok": True, "ts": dt.datetime.utcnow().isoformat()+"Z", "picks": []}
+    try:
+        uni = CONFIG.get("universe", [])
+        if not feature_store or not matrix or not pipeline_ai:
+            res["error"] = "core modules missing (feature_store/matrix/pipeline_ai)"
+            return res
+
+        # 1) Build feature frame
+        ff = feature_store.get_feature_frame(uni)
+
+        # 2) (Optional) Alpha fast plugins in Phase-1: only if available
         try:
-            with RunLock("reco_session", ttl_sec=1800):
-                a, b = run_auto_and_algo_sessions(top_k_auto=top_k, top_k_algo=None)
-                send_text(f"✅ Session complete — AUTO:{a} ALGO:{b}")
-                logger.add_meta(auto_count=a, algo_count=b)
-        except RuntimeError as e:
-            print("[lock] another run in progress; skipping:", e)
-    logger.dump()
+            if alpha_runtime and CONFIG.get("alpha",{}).get("enabled", True):
+                ff = alpha_runtime.run_enabled_alphas(ff, fast_only=True)
+        except Exception as e:
+            print("[alpha] runtime fast error:", e)
 
-# ----------------- EOD report & housekeeping triggers -----------------
+        # 3) Matrix
+        X, cols, meta, stitched = matrix.build_matrix(ff)
 
-def eod_task():
-    """
-    End-of-day: run a quick backtest on paper_trades with slippage, push summary,
-    roll up metrics, and persist heartbeat.
-    """
-    logger = RunLogger(label="eod")
-    with logger.capture_all("eod", swallow=True):
-        # backtest paper trades (if any)
-        bt_summary = {}
-        p = os.path.join(DL, "paper_trades.csv")
-        if os.path.exists(p):
-            try:
-                df = pd.read_csv(p)
-                bt_summary = backtest_trades(df, slippage_bps=5, commission_bps=1)
-                print("[backtest] summary:", bt_summary)
-            except Exception as e:
-                print("[backtest] error:", e)
+        # 4) Engine guard status (optional)
+        guard_obj = {}
+        try:
+            if engine_guard and hasattr(engine_guard, "ensure_data"):
+                guard_obj = engine_guard.ensure_data({"universe": uni})
+        except Exception as e:
+            print("[guard] error:", e)
 
-        # aggregate last 5 days stats
-        stats = summarize_last_n(days=5)
-        eod_payload = {"when_utc": _stamp(), "stats": stats, "backtest": bt_summary}
-        os.makedirs("reports/metrics", exist_ok=True)
-        with open("reports/metrics/eod.json","w", encoding="utf-8") as f:
-            json.dump(eod_payload, f, indent=2)
+        # 5) Score & select
+        picks = pipeline_ai.score_and_select(ff, X, cols, meta, top_k=top_k)
+        res["picks"] = picks
+        res["engine_guard"] = guard_obj
 
-        send_stats(stats, title="🧾 EOD Summary")
-        if bt_summary:
-            send_text(f"🧪 Backtest — trades: {bt_summary.get('trades',0)}, "
-                      f"win%: {bt_summary.get('win_rate')}, "
-                      f"pnl_sum: {round(bt_summary.get('pnl_sum',0.0),4)}")
-    logger.dump()
+        # 6) 15:15 IST notify
+        if picks:
+            if _time_gated_315pm():
+                lines = pipeline_ai.format_telegram_lines(picks)
+                footer = _engine_footer(guard_obj)
+                tg.send_recommendations("🕒 15:15 Recos (AI blend)", lines, footer=footer)
+                if CONFIG["notify"].get("debug_echo", True):
+                    print("[notify] 15:15 sent")
+            else:
+                if CONFIG["notify"].get("debug_echo", True):
+                    print("[notify] skipped 15:15 window; set notify.force_every_run=True to test")
+    except Exception as e:
+        res["ok"] = False
+        res["error"] = repr(e)
+        traceback.print_exc()
+    return res
 
-def periodic_reports_task(kind: str|None=None):
+def eod_task() -> Dict[str, Any]:
     """
-    kind: None/'daily' (default), 'weekly', 'monthly'
-    Produces aggregate metrics and pings Telegram.
+    EOD summary + optional God report. Keeps running even if report modules are absent.
     """
-    label = f"periodic_{kind or 'daily'}"
-    logger = RunLogger(label=label)
-    with logger.capture_all(label, swallow=True):
-        days = 30 if kind=="monthly" else 7 if kind=="weekly" else 5
-        stats = summarize_last_n(days=days)
-        os.makedirs("reports/metrics", exist_ok=True)
-        with open(f"reports/metrics/aggregate_{kind or 'daily'}.json","w", encoding="utf-8") as f:
-            json.dump({"when_utc": _stamp(), "kind": kind or "daily", "stats": stats}, f, indent=2)
-        if kind == "weekly":
-            send_text("📊 Weekly report rolled up.")
-        elif kind == "monthly":
-            send_text("📈 Monthly report rolled up.")
-    logger.dump()
+    out = {"ok": True, "ts": dt.datetime.utcnow().isoformat()+"Z"}
+    # EOD report
+    try:
+        if report_eod and hasattr(report_eod, "build_eod"):
+            p = report_eod.build_eod()
+            out["eod_report"] = p
+    except Exception as e:
+        out["eod_report_error"] = repr(e)
 
-def after_run_housekeeping():
+    # EOD footer ping
+    try:
+        footer = _engine_footer({})
+        tg._send(f"📦 EOD: {footer}", html=False)
+    except Exception:
+        pass
+    return out
+
+def periodic_reports_task() -> Dict[str, Any]:
     """
-    Post-run cleanup + archiving:
-      - rotations & pruning handled by RunLogger.dump()
-      - archive datalake files older than 24 months → archives/YYYY-MM.zip
+    Weekly/Monthly summaries if available.
     """
-    logger = RunLogger(label="housekeeping")
-    with logger.capture_all("housekeeping", swallow=True):
-        info = run_archiver(retention_months=24, dry_run=False)
-        hb = {"when_utc": _stamp(), "archiver": info}
-        os.makedirs("reports/metrics", exist_ok=True)
-        with open("reports/metrics/housekeeping.json","w", encoding="utf-8") as f:
-            json.dump(hb, f, indent=2)
-        print("[archiver]", info)
-        send_text("🧹 Housekeeping done (archiver OK).")
-    logger.dump()
+    out = {"ok": True}
+    try:
+        if report_period and hasattr(report_period, "run_periodic"):
+            out["periodic"] = report_period.run_periodic()
+    except Exception as e:
+        out["periodic_error"] = repr(e)
+    return out
+
+def after_run_housekeeping() -> Dict[str, Any]:
+    """
+    Lightweight cleanup hook; Phase-2 can rotate logs, compact datalake, etc.
+    """
+    return {"ok": True}
