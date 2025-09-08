@@ -1,258 +1,74 @@
-name: Hourly Train & Reports (with one-time auto-backfill + nightly AutoML)
-
+name: Hourly Train & Notify
 on:
   schedule:
-    # Pre-open warmup (IST ~09:00 => UTC 03:30)
-    - cron: "30 3 * * 1-5"
-    # Market hours (IST 09:30–15:30 => UTC 04:00–10:00, every 30 min)
-    - cron: "0,30 4-10 * * 1-5"
-    # EOD compile (IST 17:00 => UTC 11:30)
-    - cron: "30 11 * * 1-5"
-    # Weekly diagnostics (Saturday IST 10:00 => UTC 04:30 Sat)
-    - cron: "30 4 * * 6"
-    # Nightly AutoML (IST 02:00 => UTC 20:30 previous day)
-    - cron: "30 20 * * 1-5"
+    - cron: "15 * * * 1-5"   # 15 past every hour on weekdays
   workflow_dispatch: {}
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    permissions:
+      contents: read
+    timeout-minutes: 25
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python 3.11
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
 
-      - name: Install deps (yfinance, pandas, TA, etc.)
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install pandas numpy yfinance ta pyyaml || true
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install yfinance pandas numpy pyyaml requests || true
 
-      - name: Show repo tree (sanity)
-        run: |
-          echo "== repo root ==" && ls -la
-          echo "== src ==" && ls -la src || true
-          echo "== datalake ==" && ls -la datalake || true
-          echo "== datalake/features ==" && ls -la datalake/features || true
-          echo "== datalake/per_symbol ==" && ls -la datalake/per_symbol || true
-
-      # ---------- ONE-TIME AUTO-BACKFILL ----------
-      - name: One-time auto-backfill (if datalake is empty)
-        env:
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID:  ${{ secrets.TG_CHAT_ID }}
-        run: |
-          set -e
-          mkdir -p datalake/per_symbol datalake/features reports
-
-          PYTHONPATH=src python - <<'PY'
-          import os, sys, json, time
-          from pathlib import Path
-          import pandas as pd
-
-          ROOT = Path.cwd()
-          DL   = ROOT / "datalake"
-          PER  = DL / "per_symbol"
-          FEAT = DL / "features"
-          PER.mkdir(parents=True, exist_ok=True)
-          FEAT.mkdir(parents=True, exist_ok=True)
-
-          per_cnt = len(list(PER.glob("*.csv")))
-          feat_cnt = len(list(FEAT.glob("*_features.csv")))
-          status = {"per_symbol_csv": per_cnt, "features_csv": feat_cnt, "action": "skip"}
-
-          if per_cnt > 0 and feat_cnt > 0:
-              print("[auto-backfill] datalake already populated — skipping.")
-          else:
-              boot = ROOT / "datalake-bootstrap.zip"
-              if boot.exists():
-                  import zipfile, shutil
-                  print("[auto-backfill] Unzipping datalake-bootstrap.zip ...")
-                  with zipfile.ZipFile(str(boot), "r") as zf:
-                      zf.extractall(ROOT)
-                  nested = ROOT / "NIFTY500_ProPro" / "datalake"
-                  if nested.exists():
-                      for child in nested.iterdir():
-                          target = DL / child.name
-                          if child.is_dir():
-                              for sub in child.rglob("*"):
-                                  dest = DL / sub.relative_to(nested)
-                                  if sub.is_dir():
-                                      dest.mkdir(parents=True, exist_ok=True)
-                                  else:
-                                      dest.parent.mkdir(parents=True, exist_ok=True)
-                                      dest.write_bytes(sub.read_bytes())
-                          else:
-                              target.write_bytes(child.read_bytes())
-                  status["action"] = "unzip_bootstrap"
-              else:
-                  print("[auto-backfill] No bootstrap ZIP; doing light Yahoo backfill (~60d).")
-                  import yfinance as yf
-                  import numpy as np
-
-                  sector_map = DL / "sector_map.csv"
-                  tickers = []
-                  if sector_map.exists():
-                      try:
-                          dfm = pd.read_csv(sector_map)
-                          col = None
-                          for cand in ["symbol","ticker","Symbol","Ticker"]:
-                              if cand in dfm.columns:
-                                  col = cand; break
-                          if col:
-                              tickers = [str(x).strip() for x in dfm[col].dropna().unique().tolist()]
-                      except Exception:
-                          pass
-                  if not tickers:
-                      tickers = ["RELIANCE","HDFCBANK","INFY","ICICIBANK","TCS",
-                                 "SBIN","HINDUNILVR","BHARTIARTL","ITC","LT"]
-
-                  tickers = tickers[:80]
-
-                  def featureize(sym: str, df: pd.DataFrame):
-                      if df.empty: return
-                      df = df.copy()
-                      df["symbol"] = sym
-                      df["Date"] = pd.to_datetime(df.index).tz_localize(None)
-                      df = df[["Date","symbol","Open","High","Low","Close","Volume"]].dropna()
-                      df["MAN_ret1"] = df["Close"].pct_change().fillna(0.0)
-                      df["MAN_vol20"] = df["MAN_ret1"].rolling(20, min_periods=5).std().fillna(0.0)
-                      ema = df["Close"].ewm(span=20, adjust=False).mean()
-                      df["MAN_ema20slope"] = ema.pct_change().fillna(0.0)
-                      df["regime_flag"] = 0
-                      return df
-
-                  ok = 0
-                  (DL / "per_symbol").mkdir(parents=True, exist_ok=True)
-                  (DL / "features").mkdir(parents=True, exist_ok=True)
-
-                  for sym in tickers:
-                      try:
-                          yf_ticker = f"{sym}.NS"
-                          hist = yf.download(yf_ticker, period="70d", interval="1d", progress=False, threads=False)
-                          if hist is None or hist.empty: 
-                              continue
-                          hist.index = pd.to_datetime(hist.index).tz_localize(None)
-                          (DL / "per_symbol" / f"{sym}.csv").write_text(hist.to_csv(), encoding="utf-8")
-                          fdf = featureize(sym, hist)
-                          if fdf is not None and not fdf.empty:
-                              fdf.to_csv(DL / "features" / f"{sym}_features.csv", index=False)
-                              ok += 1
-                      except Exception as e:
-                          print(f"[auto-backfill] {sym}: {e}")
-                          continue
-
-                  status["action"] = f"yahoo_backfill_{ok}"
-
-          (Path("reports") / "auto_backfill_status.json").write_text(json.dumps(status, indent=2), encoding="utf-8")
-          print("[auto-backfill] STATUS:", json.dumps(status, indent=2))
-          PY
-
-          # Optional Telegram notice
-          python - <<'PY'
-          import os, json
-          from pathlib import Path
-          token = os.getenv("TG_BOT_TOKEN"); chat = os.getenv("TG_CHAT_ID")
-          try:
-              st = json.loads(Path("reports/auto_backfill_status.json").read_text())
-              if st.get("action","skip") != "skip" and token and chat:
-                  import urllib.parse, urllib.request
-                  msg = f"🧰 Auto-backfill performed: {st['action']} • per={st['per_symbol_csv']} • feat={st['features_csv']}"
-                  url = f"https://api.telegram.org/bot{token}/sendMessage"
-                  payload = urllib.parse.urlencode({"chat_id": chat, "text": msg}).encode()
-                  urllib.request.urlopen(url, data=payload, timeout=10).read()
-          except Exception:
-              pass
-          PY
-
-      - name: Import smoke (non-fatal)
+      - name: Ingest light slices (daily/intraday/macro/options heartbeat)
         run: |
           python - <<'PY'
           import sys; sys.path.append("src")
-          mods = ["pipeline","pipeline_ai","model_selector","engine_registry","config"]
-          bad=[]
-          for m in mods:
-            try: __import__(m)
-            except Exception as e: bad.append((m,repr(e)))
-          print("Import check:", "OK" if not bad else bad)
+          from config import CONFIG
+          import data_ingest as di
+          uni = CONFIG.get("universe", [])
+          print(di.run_all(uni))
           PY
 
-      - name: Hourly (pre-open & market)
-        if: |
-          github.event_name == 'workflow_dispatch' ||
-          startsWith(github.event.schedule, '0,30 4-10') || startsWith(github.event.schedule, '30 3')
+      - name: Run hourly picks (3:15 gate inside)
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID:  ${{ secrets.TG_CHAT_ID }}
         run: |
           python - <<'PY'
           import sys; sys.path.append("src")
-          try:
-              from pipeline_ai import ai_hourly
-              print(ai_hourly(top_k=5))
-          except Exception as e:
-              print("ai_hourly failed, fallback to pipeline.hourly_run:", e)
-              from pipeline import hourly_run
-              print(hourly_run(top_k=5))
+          from entrypoints import hourly_live_or_paper
+          out = hourly_live_or_paper(top_k=5)
+          print(out)
           PY
 
-      - name: EOD compile (reports)
-        if: github.event.schedule == '30 11 * * 1-5'
+      - name: EOD & periodic (safe no-op outside window)
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID:  ${{ secrets.TG_CHAT_ID }}
         run: |
           python - <<'PY'
           import sys; sys.path.append("src")
-          try:
-              from pipeline_ai import ai_eod
-              print(ai_eod(top_k=5))
-          except Exception as e:
-              print("ai_eod failed, fallback to pipeline.eod_run:", e)
-              from pipeline import eod_run
-              print(eod_run(top_k=5))
+          from entrypoints import eod_task, periodic_reports_task, after_run_housekeeping
+          print(eod_task())
+          print(periodic_reports_task())
+          print(after_run_housekeeping())
           PY
 
-      - name: Weekly diagnostics
-        if: github.event.schedule == '30 4 * * 6'
-        env:
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID:  ${{ secrets.TG_CHAT_ID }}
+      - name: Auto Bug Fix (safe, non-fatal)
         run: |
           python - <<'PY'
           import sys; sys.path.append("src")
+          import json
           try:
-              from pipeline_ai import ai_weekly
-              print(ai_weekly())
+            from auto_bugfixer import main
+            print("AUTO_FIX:", json.dumps(main(), indent=2))
           except Exception as e:
-              print("ai_weekly failed, fallback to pipeline.weekly_run:", e)
-              from pipeline import weekly_run
-              print(weekly_run())
+            print("Autofix missing:", e)
           PY
-
-      - name: Nightly AutoML
-        if: github.event.schedule == '30 20 * * 1-5'
-        run: |
-          python - <<'PY'
-          import sys; sys.path.append("src")
-          try:
-              from pipeline_ai import ai_nightly_automl
-              print(ai_nightly_automl())
-          except Exception as e:
-              print("ai_nightly_automl failed:", e)
-          PY
-
-      - name: Upload reports artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: reports_bundle
-          path: |
-            reports/**
-            datalake/paper_trades.csv
-          if-no-files-found: warn
