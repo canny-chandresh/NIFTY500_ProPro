@@ -1,0 +1,42 @@
+name: V2 Self-Audit
+on:
+  workflow_dispatch: {}
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy pyyaml
+      - name: Tree & sanity
+        run: |
+          echo "== Tree =="
+          ls -la
+          echo "== src =="
+          ls -la src || true
+      - name: Import check
+        run: |
+          python - <<'PY'
+          import sys, json
+          sys.path.append("src")
+          mods = [
+            "config","entrypoints","pipeline_ai","model_selector","telegram",
+            "data_ingest","feature_store","matrix","engine_guard",
+            "alpha.registry","alpha.runtime",
+            "discovery.feature_discovery","discovery.schema_registry",
+            "discovery.extractors.market_extractor",
+            "discovery.extractors.news_extractor",
+            "discovery.extractors.altmacro_extractor",
+            "diag_data","diag_screener"
+          ]
+          errs={}
+          for m in mods:
+            try: __import__(m)
+            except Exception as e: errs[m]=repr(e)
+          print(json.dumps({"ok": not bool(errs), "errors": errs}, indent=2))
+          PY
