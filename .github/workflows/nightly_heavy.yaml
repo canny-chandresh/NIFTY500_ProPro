@@ -1,0 +1,69 @@
+name: Nightly Heavy (DL/Backtests/Calibration)
+on:
+  schedule:
+    - cron: "30 18 * * 1-5"   # 00:00 IST approx (adjust as desired)
+  workflow_dispatch: {}
+
+jobs:
+  heavy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps (DL-capable)
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install yfinance pandas numpy scikit-learn xgboost catboost pyyaml requests || true
+
+      - name: Ensure recent data is present
+        run: |
+          python - <<'PY'
+          import sys; sys.path.append("src")
+          from config import CONFIG
+          import data_ingest as di
+          uni = CONFIG.get("universe", [])
+          print(di.run_all(uni))
+          PY
+
+      - name: (Placeholder) Train DL/Boosters/Stacker/Calib
+        run: |
+          python - <<'PY'
+          # Keep it short for now; your existing private trainers can be dropped here later.
+          import json, os, sys
+          from pathlib import Path
+          sys.path.append("src")
+          from config import CONFIG
+          BASE = Path(CONFIG["paths"]["datalake"])/"features_runtime"
+          for d in ["dl_ft","dl_tcn","dl_tst","meta","calibration","boosters"]:
+            (BASE/d).mkdir(parents=True, exist_ok=True)
+          # Touch artifacts to enable engines (you will replace with real training artifacts)
+          (BASE/"dl_ft"/"ft_transformer.pt").write_text("stub")
+          (BASE/"dl_tcn"/"tcn.pt").write_text("stub")
+          (BASE/"dl_tst"/"tst.pt").write_text("stub")
+          (BASE/"meta"/"stacker.json").write_text(json.dumps({"ml":0.2,"boost":0.5,"ft":0.3,"tcn":0.2,"tst":0.3}))
+          (BASE/"calibration"/"platt.json").write_text(json.dumps({"a":1.0,"b":0.0,"sigma":0.15}))
+          print("Artifacts touched (stubs) – replace with real models when ready.")
+          PY
+
+      - name: Auto Bug Fix (safe, non-fatal)
+        run: |
+          python - <<'PY'
+          import sys; sys.path.append("src")
+          import json
+          try:
+            from auto_bugfixer import main
+            print("AUTO_FIX:", json.dumps(main(), indent=2))
+          except Exception as e:
+            print("Autofix missing:", e)
+          PY
