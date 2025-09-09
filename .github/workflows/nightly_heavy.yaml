@@ -2,12 +2,9 @@ name: Nightly Heavy (Deep Train ➜ Discovery ➜ WF Backtests ➜ Reports)
 
 on:
   schedule:
-    # Nightly after market: 22:00 IST → 16:30 UTC
-    - cron: "30 16 * * 1-5"
-    # Weekly discovery & recap: Saturday 18:00 IST → 12:30 UTC
-    - cron: "30 12 * * 6"
-    # Monthly recap: last day 18:30 IST → 13:00 UTC
-    - cron: "0 13 28-31 * *"
+    - cron: "30 16 * * 1-5"   # ~22:00 IST
+    - cron: "30 12 * * 6"     # Saturday weekly recap ~18:00 IST
+    - cron: "0 13 28-31 * *"  # month-end recap window
   workflow_dispatch: {}
 
 jobs:
@@ -39,7 +36,6 @@ jobs:
         run: |
           mkdir -p reports/debug models datalake
 
-      # ---------- Ingest once more (keeps nightly fresh) ----------
       - name: Ingest (nightly refresh)
         run: |
           python - <<'PY'
@@ -57,68 +53,83 @@ jobs:
           print(options_ingest.fetch_and_store())
           PY
 
-      # ---------- Heavy training: ML/DL/stacker/calibration ----------
       - name: Heavy training & calibrations
         run: |
           python - <<'PY'
           import sys, traceback; sys.path.append("src")
           try:
-              from pipeline_ai import nightly_heavy_train
-              nightly_heavy_train()
+            from pipeline_ai import nightly_heavy_train
+            nightly_heavy_train()
           except Exception as e:
-              print("nightly_heavy_train error:", e); traceback.print_exc()
+            print("nightly_heavy_train error:", e); traceback.print_exc()
           PY
 
-      # ---------- Feature discovery (nightly + weekly) ----------
       - name: Discovery + (optional) auto-promote to shadow
         run: |
           python - <<'PY'
           import sys, traceback; sys.path.append("src")
           try:
-              import discovery_scheduler
-              discovery_scheduler.nightly()
+            import discovery_scheduler
+            discovery_scheduler.nightly()
           except Exception as e:
-              print("discovery nightly error:", e); traceback.print_exc()
+            print("discovery nightly error:", e); traceback.print_exc()
           PY
 
-      # ---------- Walk-forward backtests & risk ----------
       - name: Walk-forward backtests (purged+embargoed)
         run: |
           python - <<'PY'
           import sys, traceback; sys.path.append("src")
           try:
-              import backtest_wf
-              backtest_wf.run_all()
+            import backtest_wf
+            backtest_wf.run_all()
           except Exception as e:
-              print("WF backtest error:", e); traceback.print_exc()
+            print("WF backtest error:", e); traceback.print_exc()
           PY
 
-      # ---------- Reports: EOD (always), Weekly (Sat), Monthly (Month-end) ----------
       - name: Build reports (EOD/Weekly/Monthly)
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID:  ${{ secrets.TG_CHAT_ID }}
         run: |
           python - <<'PY'
-          import sys, datetime as dt; sys.path.append("src")
-          from entrypoints import eod_task, periodic_reports_task
+          import sys, datetime as dt, calendar; sys.path.append("src")
+          try:
+            from entrypoints import eod_task, periodic_reports_task
+          except Exception as e:
+            print("entrypoints import error:", e); eod_task = periodic_reports_task = None
+
           # Always do EOD
-          try: eod_task()
-          except Exception as e: print("EOD error:", e)
-          # Weekly (Sat)
+          if eod_task:
+            try: eod_task()
+            except Exception as e: print("EOD error:", e)
+
           ist = dt.datetime.utcnow() + dt.timedelta(hours=5, minutes=30)
-          if ist.weekday() == 5:
-              try: periodic_reports_task(kind="weekly")
-              except Exception as e: print("Weekly report error:", e)
-          # Monthly (month-end guess)
-          import calendar
+          # Weekly (Saturday)
+          if periodic_reports_task and ist.weekday() == 5:
+            try: periodic_reports_task(kind="weekly")
+            except Exception as e: print("Weekly report error:", e)
+          # Month-end
           last_day = calendar.monthrange(ist.year, ist.month)[1]
-          if ist.day == last_day:
-              try: periodic_reports_task(kind="monthly")
-              except Exception as e: print("Monthly report error:", e)
+          if periodic_reports_task and ist.day == last_day:
+            try: periodic_reports_task(kind="monthly")
+            except Exception as e: print("Monthly report error:", e)
           PY
 
-      # ---------- Upload nightly artifacts ----------
+      # ✅ Optional nightly healthcheck too (same path-safe import)
+      - name: Nightly Healthcheck (no-telegram)
+        run: |
+          python - <<'PY'
+          import sys; sys.path.append("src")
+          try:
+            import healthcheck
+            if hasattr(healthcheck, "main"):
+              healthcheck.main(send_telegram=False)
+            elif hasattr(healthcheck, "run"):
+              healthcheck.run(send_telegram=False)
+          except Exception as e:
+            print("nightly healthcheck error:", e)
+          PY
+
       - name: Upload nightly artifacts (always)
         if: always()
         uses: actions/upload-artifact@v4
