@@ -1,74 +1,120 @@
-name: Hourly Train & Notify
+name: Hourly Train & Daily Notify
+
 on:
   schedule:
-    - cron: "15 * * * 1-5"   # 15 past every hour on weekdays
+    # Every market hour (Mon–Fri) at :15 — adjust if you like
+    - cron: "15 * * * 1-5"
   workflow_dispatch: {}
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    timeout-minutes: 25
+    timeout-minutes: 30
+    env:
+      TZ: Asia/Kolkata
+      PYTHONUNBUFFERED: "1"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Show tree (sanity)
+        run: |
+          echo "== repo root =="; ls -la
+          echo "== src =="; ls -la src || true
+          echo "== workflows =="; ls -la .github/workflows || true
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install deps (lean daytime)
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          pip install yfinance pandas numpy pyyaml requests || true
+          pip install pandas numpy scikit-learn pyarrow fastparquet yfinance ta
+          # news sentiment (optional but enabled now)
+          pip install feedparser vaderSentiment || true
 
-      - name: Ingest light slices (daily/intraday/macro/options heartbeat)
+      # ---------- DATA INGEST ----------
+      - name: Ingest (daily + intraday today + macro)
         run: |
           python - <<'PY'
           import sys; sys.path.append("src")
           from config import CONFIG
           import data_ingest as di
           uni = CONFIG.get("universe", [])
-          print(di.run_all(uni))
+          out = di.run_all(uni)
+          print("INGEST_SUMMARY:", out)
           PY
 
-      - name: Run hourly picks (3:15 gate inside)
-        env:
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID:  ${{ secrets.TG_CHAT_ID }}
+      # ---------- NEWS SENTIMENT (hourly) ----------
+      - name: News sentiment (hourly)
         run: |
           python - <<'PY'
           import sys; sys.path.append("src")
-          from entrypoints import hourly_live_or_paper
-          out = hourly_live_or_paper(top_k=5)
-          print(out)
-          PY
-
-      - name: EOD & periodic (safe no-op outside window)
-        env:
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID:  ${{ secrets.TG_CHAT_ID }}
-        run: |
-          python - <<'PY'
-          import sys; sys.path.append("src")
-          from entrypoints import eod_task, periodic_reports_task, after_run_housekeeping
-          print(eod_task())
-          print(periodic_reports_task())
-          print(after_run_housekeeping())
-          PY
-
-      - name: Auto Bug Fix (safe, non-fatal)
-        run: |
-          python - <<'PY'
-          import sys; sys.path.append("src")
-          import json
           try:
-            from auto_bugfixer import main
-            print("AUTO_FIX:", json.dumps(main(), indent=2))
+            from discovery.extractors.news_extractor import fetch
+            print(fetch())
           except Exception as e:
-            print("Autofix missing:", e)
+            print("news_extractor skipped / soft-fail:", e)
           PY
+
+      # ---------- FAST ALPHAS (hourly-safe) ----------
+      - name: Compute fast alphas
+        run: |
+          python - <<'PY'
+          import sys; sys.path.append("src")
+          import feature_store
+          from alpha.runtime import run_enabled_alphas
+          from config import CONFIG
+          ff = feature_store.get_feature_frame(CONFIG.get("universe", []))
+          out = run_enabled_alphas(ff, fast_only=True)
+          print({"alpha_cols": [c for c in out.columns if c.startswith("alpha_")]})
+          PY
+
+      # ---------- MAIN PIPELINE (lean) ----------
+      - name: Run pipeline (safe wrappers)
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID:  ${{ secrets.TG_CHAT_ID }}
+        run: |
+          python - <<'PY'
+          import sys, traceback; sys.path.append("src")
+          from pathlib import Path
+
+          def safe(label, fn):
+              print(f">> {label}")
+              try:
+                  fn(); print(f"<< {label} OK")
+              except Exception as e:
+                  print(f"<< {label} ERROR: {e}")
+                  traceback.print_exc()
+
+          try:
+              from entrypoints import daily_update, eod_task, periodic_reports_task, after_run_housekeeping
+              from pipeline import run_paper_session
+          except Exception as e:
+              print("Import error:", e); traceback.print_exc(); raise SystemExit(0)
+
+          safe("daily_update()", lambda: daily_update())
+          safe("run_paper_session(top_k=5)", lambda: run_paper_session(top_k=5))
+          # EOD and periodic are internally time-gated (15:15 IST window, etc.)
+          safe("eod_task()", lambda: eod_task())
+          safe("periodic_reports_task()", lambda: periodic_reports_task())
+          safe("after_run_housekeeping()", lambda: after_run_housekeeping())
+          raise SystemExit(0)
+          PY
+
+      # ---------- ARTIFACTS (logs & reports) ----------
+      - name: Upload debug logs (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug_hourly
+          path: |
+            reports/debug/**
+            reports/eod/**
+            reports/periodic/**
+            datalake/**
+          if-no-files-found: ignore
