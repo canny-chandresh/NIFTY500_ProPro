@@ -1,15 +1,19 @@
-name: Hourly Train & Daily Notify
+name: Hourly Lean (Ingest ➜ Alphas ➜ Health ➜ Telegram)
 
 on:
+  # ⏱ Hourly during Indian market (Mon–Fri). Times are UTC.
   schedule:
-    # Every market hour (Mon–Fri) at :15 — adjust if you like
-    - cron: "15 * * * 1-5"
+    # 09:15–15:30 IST ≈ 03:45–10:00 UTC; we trigger at :45 each hour
+    - cron: "45 3-9 * * 1-5"   # 09:45, 10:45, 11:45, 12:45, 13:45, 14:45, 15:45 IST
+    # EOD/summary at 17:00 IST → 11:30 UTC
+    - cron: "30 11 * * 1-5"
+  # ▶ manual trigger
   workflow_dispatch: {}
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     env:
       TZ: Asia/Kolkata
       PYTHONUNBUFFERED: "1"
@@ -18,49 +22,47 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Show tree (sanity)
-        run: |
-          echo "== repo root =="; ls -la
-          echo "== src =="; ls -la src || true
-          echo "== workflows =="; ls -la .github/workflows || true
-
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install deps (lean daytime)
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install pandas numpy scikit-learn pyarrow fastparquet yfinance ta
-          # news sentiment (optional but enabled now)
-          pip install feedparser vaderSentiment || true
+          pip install pandas numpy scikit-learn pyarrow fastparquet requests yfinance ta
+          pip install feedparser vaderSentiment
 
-      # ---------- DATA INGEST ----------
-      - name: Ingest (daily + intraday today + macro)
+      # (Optional) bootstrap datalake once if you uploaded a seed zip
+      - name: Ensure datalake exists (unpack once)
+        run: |
+          if [ ! -d "datalake" ] && [ -f "datalake-bootstrap.zip" ]; then
+            unzip -o datalake-bootstrap.zip -d .
+            echo "Bootstrapped datalake from ZIP."
+          fi
+          mkdir -p reports/debug
+
+      # ---------- Ingest (NSE-first with Yahoo fallback) ----------
+      - name: Ingest daily+intraday+macro (lean)
         run: |
           python - <<'PY'
           import sys; sys.path.append("src")
           from config import CONFIG
           import data_ingest as di
           uni = CONFIG.get("universe", [])
-          out = di.run_all(uni)
-          print("INGEST_SUMMARY:", out)
+          print(di.run_all(uni))
           PY
 
-      # ---------- NEWS SENTIMENT (hourly) ----------
-      - name: News sentiment (hourly)
+      # ---------- Options chain (NSE primary ➜ synthetic fallback) ----------
+      - name: Options ingest (NSE primary)
         run: |
           python - <<'PY'
           import sys; sys.path.append("src")
-          try:
-            from discovery.extractors.news_extractor import fetch
-            print(fetch())
-          except Exception as e:
-            print("news_extractor skipped / soft-fail:", e)
+          import options_ingest
+          print(options_ingest.fetch_and_store())
           PY
 
-      # ---------- FAST ALPHAS (hourly-safe) ----------
+      # ---------- Fast alphas so matrix is alive hourly ----------
       - name: Compute fast alphas
         run: |
           python - <<'PY'
@@ -73,48 +75,51 @@ jobs:
           print({"alpha_cols": [c for c in out.columns if c.startswith("alpha_")]})
           PY
 
-      # ---------- MAIN PIPELINE (lean) ----------
-      - name: Run pipeline (safe wrappers)
+      # ---------- Healthcheck + Telegram ping ----------
+      - name: Healthcheck + Telegram
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID:  ${{ secrets.TG_CHAT_ID }}
+        run: |
+          python -m pip install --upgrade pip >/dev/null 2>&1
+          python - <<'PY'
+          import sys; sys.path.append("src")
+          import healthcheck
+          healthcheck.run(send_telegram=True)
+          PY
+
+      # ---------- EOD reports at 17:00 IST only ----------
+      - name: EOD summary (only around 17:00 IST)
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID:  ${{ secrets.TG_CHAT_ID }}
         run: |
           python - <<'PY'
-          import sys, traceback; sys.path.append("src")
-          from pathlib import Path
-
-          def safe(label, fn):
-              print(f">> {label}")
+          import os, sys, datetime as dt
+          sys.path.append("src")
+          from config import CONFIG
+          # Send only inside a 15-minute window around 17:00 IST
+          ist = dt.datetime.utcnow() + dt.timedelta(hours=5, minutes=30)
+          if ist.hour == 17 and ist.minute <= 15:
               try:
-                  fn(); print(f"<< {label} OK")
+                  from entrypoints import eod_task
+                  eod_task()
               except Exception as e:
-                  print(f"<< {label} ERROR: {e}")
-                  traceback.print_exc()
-
-          try:
-              from entrypoints import daily_update, eod_task, periodic_reports_task, after_run_housekeeping
-              from pipeline import run_paper_session
-          except Exception as e:
-              print("Import error:", e); traceback.print_exc(); raise SystemExit(0)
-
-          safe("daily_update()", lambda: daily_update())
-          safe("run_paper_session(top_k=5)", lambda: run_paper_session(top_k=5))
-          # EOD and periodic are internally time-gated (15:15 IST window, etc.)
-          safe("eod_task()", lambda: eod_task())
-          safe("periodic_reports_task()", lambda: periodic_reports_task())
-          safe("after_run_housekeeping()", lambda: after_run_housekeeping())
-          raise SystemExit(0)
+                  print("EOD task error:", e)
+          else:
+              print("Skipping EOD (not in 17:00 IST window).")
           PY
 
-      # ---------- ARTIFACTS (logs & reports) ----------
-      - name: Upload debug logs (always)
+      # ---------- Upload useful artifacts ----------
+      - name: Upload health artifacts (always)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: debug_hourly
+          name: hourly_artifacts
           path: |
+            reports/**/*
+            datalake/daily_hot.parquet
+            datalake/intraday/5m/*.csv
+            datalake/options/*.jsonl
             reports/debug/**
-            reports/eod/**
-            reports/periodic/**
-            datalake/**
-          if-no-files-found: ignore
+          if-no-files-found: warn
