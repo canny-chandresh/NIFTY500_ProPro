@@ -1,0 +1,71 @@
+name: Manual Healthcheck (Ingest + Verify + Telegram)
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      TZ: Asia/Kolkata
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy scikit-learn pyarrow fastparquet yfinance ta
+          pip install feedparser vaderSentiment || true
+
+      # --- Ingest (populate datalake) ---
+      - name: Ingest daily+intraday+macro (one pass)
+        run: |
+          python - <<'PY'
+          import sys; sys.path.append("src")
+          from config import CONFIG
+          import data_ingest as di
+          uni = CONFIG.get("universe", [])
+          print(di.run_all(uni))
+          PY
+
+      # --- Compute fast alphas (hourly-safe) so matrix is alive ---
+      - name: Compute fast alphas
+        run: |
+          python - <<'PY'
+          import sys; sys.path.append("src")
+          import feature_store
+          from alpha.runtime import run_enabled_alphas
+          from config import CONFIG
+          ff = feature_store.get_feature_frame(CONFIG.get("universe", []))
+          out = run_enabled_alphas(ff, fast_only=True)
+          print({"alpha_cols": [c for c in out.columns if c.startswith("alpha_")]})
+          PY
+
+      # --- Healthcheck & Telegram ---
+      - name: Healthcheck + Telegram
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID:  ${{ secrets.TG_CHAT_ID }}
+        run: |
+          python -m healthcheck
+
+      # --- Artifacts for debugging ---
+      - name: Upload health artifacts (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: manual_healthcheck_artifacts
+          path: |
+            reports/debug/healthcheck.json
+            reports/debug/**
+            datalake/**
+          if-no-files-found: warn
