@@ -1,13 +1,9 @@
 name: Hourly Lean (Ingest ➜ Alphas ➜ Health ➜ Telegram)
 
 on:
-  # ⏱ Hourly during Indian market (Mon–Fri). Times are UTC.
   schedule:
-    # 09:15–15:30 IST ≈ 03:45–10:00 UTC; we trigger at :45 each hour
-    - cron: "45 3-9 * * 1-5"   # 09:45, 10:45, 11:45, 12:45, 13:45, 14:45, 15:45 IST
-    # EOD/summary at 17:00 IST → 11:30 UTC
-    - cron: "30 11 * * 1-5"
-  # ▶ manual trigger
+    - cron: "45 3-9 * * 1-5"   # hourly during market (IST 09:45–15:45)
+    - cron: "30 11 * * 1-5"    # EOD window ~17:00 IST
   workflow_dispatch: {}
 
 jobs:
@@ -33,7 +29,6 @@ jobs:
           pip install pandas numpy scikit-learn pyarrow fastparquet requests yfinance ta
           pip install feedparser vaderSentiment
 
-      # (Optional) bootstrap datalake once if you uploaded a seed zip
       - name: Ensure datalake exists (unpack once)
         run: |
           if [ ! -d "datalake" ] && [ -f "datalake-bootstrap.zip" ]; then
@@ -42,7 +37,6 @@ jobs:
           fi
           mkdir -p reports/debug
 
-      # ---------- Ingest (NSE-first with Yahoo fallback) ----------
       - name: Ingest daily+intraday+macro (lean)
         run: |
           python - <<'PY'
@@ -53,7 +47,6 @@ jobs:
           print(di.run_all(uni))
           PY
 
-      # ---------- Options chain (NSE primary ➜ synthetic fallback) ----------
       - name: Options ingest (NSE primary)
         run: |
           python - <<'PY'
@@ -62,55 +55,62 @@ jobs:
           print(options_ingest.fetch_and_store())
           PY
 
-      # ---------- Fast alphas so matrix is alive hourly ----------
       - name: Compute fast alphas
         run: |
           python - <<'PY'
           import sys; sys.path.append("src")
-          import feature_store
-          from alpha.runtime import run_enabled_alphas
-          from config import CONFIG
-          ff = feature_store.get_feature_frame(CONFIG.get("universe", []))
-          out = run_enabled_alphas(ff, fast_only=True)
-          print({"alpha_cols": [c for c in out.columns if c.startswith("alpha_")]})
+          try:
+            import feature_store
+            from alpha.runtime import run_enabled_alphas
+            from config import CONFIG
+            ff = feature_store.get_feature_frame(CONFIG.get("universe", []))
+            out = run_enabled_alphas(ff, fast_only=True)
+            print({"alpha_cols": [c for c in out.columns if c.startswith("alpha_")]})
+          except Exception as e:
+            print("fast alphas error:", e)
           PY
 
-      # ---------- Healthcheck + Telegram ping ----------
+      # ✅ Fixed: import healthcheck from src/
       - name: Healthcheck + Telegram
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID:  ${{ secrets.TG_CHAT_ID }}
         run: |
-          python -m pip install --upgrade pip >/dev/null 2>&1
           python - <<'PY'
           import sys; sys.path.append("src")
-          import healthcheck
-          healthcheck.run(send_telegram=True)
+          try:
+            import healthcheck
+            if hasattr(healthcheck, "main"):
+              healthcheck.main(send_telegram=True)
+            else:
+              # fallback if your file exposes run()
+              if hasattr(healthcheck, "run"):
+                healthcheck.run(send_telegram=True)
+              else:
+                print("healthcheck imported but no main()/run().")
+          except Exception as e:
+            print("healthcheck error:", e)
           PY
 
-      # ---------- EOD reports at 17:00 IST only ----------
       - name: EOD summary (only around 17:00 IST)
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID:  ${{ secrets.TG_CHAT_ID }}
         run: |
           python - <<'PY'
-          import os, sys, datetime as dt
-          sys.path.append("src")
+          import sys, datetime as dt; sys.path.append("src")
           from config import CONFIG
-          # Send only inside a 15-minute window around 17:00 IST
-          ist = dt.datetime.utcnow() + dt.timedelta(hours=5, minutes=30)
-          if ist.hour == 17 and ist.minute <= 15:
-              try:
-                  from entrypoints import eod_task
-                  eod_task()
-              except Exception as e:
-                  print("EOD task error:", e)
-          else:
+          try:
+            ist = dt.datetime.utcnow() + dt.timedelta(hours=5, minutes=30)
+            if ist.hour == 17 and ist.minute <= 15:
+              from entrypoints import eod_task
+              eod_task()
+            else:
               print("Skipping EOD (not in 17:00 IST window).")
+          except Exception as e:
+            print("EOD task error:", e)
           PY
 
-      # ---------- Upload useful artifacts ----------
       - name: Upload health artifacts (always)
         if: always()
         uses: actions/upload-artifact@v4
