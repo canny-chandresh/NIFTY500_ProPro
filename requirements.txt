@@ -28,3 +28,15 @@ pyarrow>=15.0
 # Utilities
 matplotlib>=3.8
 seaborn>=0.13
+
+xgboost
+lightgbm
+catboost
+torch==2.2.2
+torchvision==0.17.2
+torchaudio==2.2.2
+einops
+torchmetrics
+scikit-learn
+pandas
+numpy
