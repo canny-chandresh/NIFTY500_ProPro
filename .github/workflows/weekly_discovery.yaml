@@ -1,0 +1,42 @@
+name: Weekly Discovery (Long Horizon)
+on:
+  schedule:
+    - cron: "0 3 * * 6"   # Saturdays 03:00 UTC (~8:30 IST); adjust if needed
+  workflow_dispatch: {}
+
+jobs:
+  weekly:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy scikit-learn yfinance pyyaml
+
+      - name: Ensure data is fresh (free sources)
+        run: |
+          python - <<'PY'
+          import sys; sys.path.append("src")
+          from config import CONFIG
+          import data_ingest as di
+          uni = CONFIG.get("universe", [])
+          print(di.run_all(uni))
+          PY
+
+      - name: Weekly discovery (3–6M horizon)
+        run: |
+          python - <<'PY'
+          import sys; sys.path.append("src")
+          from discovery.discovery_scheduler import nightly
+          out = nightly()  # same scheduler; long horizon is inside file
+          print(out)
+          PY
