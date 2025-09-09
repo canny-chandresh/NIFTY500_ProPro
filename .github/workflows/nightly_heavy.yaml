@@ -1,13 +1,17 @@
-name: Nightly Heavy (Train + Discovery)
+name: Nightly Heavy (Deep Train ➜ Discovery ➜ WF Backtests ➜ Reports)
 
 on:
   schedule:
-    # ~16:05 UTC = 21:35 IST — after market close & EOD settles. Adjust as needed.
-    - cron: "5 16 * * 1-5"
+    # Nightly after market: 22:00 IST → 16:30 UTC
+    - cron: "30 16 * * 1-5"
+    # Weekly discovery & recap: Saturday 18:00 IST → 12:30 UTC
+    - cron: "30 12 * * 6"
+    # Monthly recap: last day 18:30 IST → 13:00 UTC
+    - cron: "0 13 28-31 * *"
   workflow_dispatch: {}
 
 jobs:
-  nightly:
+  heavy:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
@@ -26,88 +30,102 @@ jobs:
       - name: Install deps (heavy)
         run: |
           python -m pip install --upgrade pip
-          pip install pandas numpy scikit-learn pyarrow fastparquet yfinance ta pyyaml
-          pip install feedparser vaderSentiment || true
-          # boosters + DL stacks
-          pip install xgboost lightgbm catboost
-          pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
-          pip install einops torchmetrics
+          pip install pandas numpy scikit-learn xgboost lightgbm catboost
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install pyarrow fastparquet requests yfinance ta
+          pip install optuna feedparser vaderSentiment
 
-      # ---------- DATA REFRESH ----------
-      - name: Ensure recent data is present
+      - name: Ensure folders
+        run: |
+          mkdir -p reports/debug models datalake
+
+      # ---------- Ingest once more (keeps nightly fresh) ----------
+      - name: Ingest (nightly refresh)
         run: |
           python - <<'PY'
           import sys; sys.path.append("src")
           from config import CONFIG
           import data_ingest as di
-          uni = CONFIG.get("universe", [])
-          print(di.run_all(uni))
+          print(di.run_all(CONFIG.get("universe", [])))
           PY
 
-      # ---------- FULL ALPHAS (nightly, not just fast) ----------
-      - name: Compute all alphas (nightly)
+      - name: Options ingest (nightly)
         run: |
           python - <<'PY'
           import sys; sys.path.append("src")
-          from config import CONFIG
-          import feature_store
-          from alpha.runtime import run_enabled_alphas
-          ff = feature_store.get_feature_frame(CONFIG.get("universe", []))
-          out = run_enabled_alphas(ff, fast_only=False)
-          print({"alpha_cols": [c for c in out.columns if c.startswith("alpha_")]})
+          import options_ingest
+          print(options_ingest.fetch_and_store())
           PY
 
-      # ---------- ANOMALY (IsolationForest) ----------
-      - name: Anomaly detection
+      # ---------- Heavy training: ML/DL/stacker/calibration ----------
+      - name: Heavy training & calibrations
         run: |
           python - <<'PY'
-          import sys; sys.path.append("src")
-          from config import CONFIG
-          import feature_store
-          from engines.anomaly_iforest import run as run_anom
-          ff = feature_store.get_feature_frame(CONFIG.get("universe", []))
-          print(run_anom(ff))
+          import sys, traceback; sys.path.append("src")
+          try:
+              from pipeline_ai import nightly_heavy_train
+              nightly_heavy_train()
+          except Exception as e:
+              print("nightly_heavy_train error:", e); traceback.print_exc()
           PY
 
-      # ---------- DISCOVERY (nightly; weekly job uses same scheduler with longer horizon) ----------
-      - name: Discovery & (optional) Auto-Promote
+      # ---------- Feature discovery (nightly + weekly) ----------
+      - name: Discovery + (optional) auto-promote to shadow
         run: |
           python - <<'PY'
-          import sys; sys.path.append("src")
-          from discovery.discovery_scheduler import nightly
-          print(nightly())
+          import sys, traceback; sys.path.append("src")
+          try:
+              import discovery_scheduler
+              discovery_scheduler.nightly()
+          except Exception as e:
+              print("discovery nightly error:", e); traceback.print_exc()
           PY
 
-      # ---------- BOOTSTRAP HEAVY ENGINES ----------
-      - name: Bootstrap & Train heavy engines
+      # ---------- Walk-forward backtests & risk ----------
+      - name: Walk-forward backtests (purged+embargoed)
         run: |
           python - <<'PY'
-          import sys; sys.path.append("src")
-          from engines.bootstrap_heavy import run
-          print(run())
+          import sys, traceback; sys.path.append("src")
+          try:
+              import backtest_wf
+              backtest_wf.run_all()
+          except Exception as e:
+              print("WF backtest error:", e); traceback.print_exc()
           PY
 
-      # ---------- PERIODIC REPORTS (weekly/monthly if boundary) ----------
-      - name: Periodic reports (weekly/monthly)
+      # ---------- Reports: EOD (always), Weekly (Sat), Monthly (Month-end) ----------
+      - name: Build reports (EOD/Weekly/Monthly)
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID:  ${{ secrets.TG_CHAT_ID }}
         run: |
           python - <<'PY'
-          import sys; sys.path.append("src")
-          from entrypoints import periodic_reports_task, after_run_housekeeping
-          periodic_reports_task()
-          after_run_housekeeping()
+          import sys, datetime as dt; sys.path.append("src")
+          from entrypoints import eod_task, periodic_reports_task
+          # Always do EOD
+          try: eod_task()
+          except Exception as e: print("EOD error:", e)
+          # Weekly (Sat)
+          ist = dt.datetime.utcnow() + dt.timedelta(hours=5, minutes=30)
+          if ist.weekday() == 5:
+              try: periodic_reports_task(kind="weekly")
+              except Exception as e: print("Weekly report error:", e)
+          # Monthly (month-end guess)
+          import calendar
+          last_day = calendar.monthrange(ist.year, ist.month)[1]
+          if ist.day == last_day:
+              try: periodic_reports_task(kind="monthly")
+              except Exception as e: print("Monthly report error:", e)
           PY
 
-      # ---------- ARTIFACTS ----------
+      # ---------- Upload nightly artifacts ----------
       - name: Upload nightly artifacts (always)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: nightly_heavy_artifacts
+          name: nightly_artifacts
           path: |
-            models/**
-            reports/**
-            datalake/**
-          if-no-files-found: ignore
+            reports/**/*
+            datalake/**/*
+            models/**/*
+          if-no-files-found: warn
