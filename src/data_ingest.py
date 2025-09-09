@@ -1,155 +1,164 @@
 # -*- coding: utf-8 -*-
 """
-data_ingest.py
-One-stop ingestion for daily + intraday (5m) using yfinance, with robust logging.
+data_ingest.py — NSE-first ingestion with Yahoo fallback.
 Writes:
-  - datalake/per_symbol/<SYMBOL>.csv      (rolling OHLCV daily)
-  - datalake/daily_hot.parquet            (joined latest daily rows)
-  - datalake/intraday/5m/<SYMBOL>.csv     (today's 5m bars, if market day)
+  - datalake/per_symbol/<SYMBOL>.csv      (rolling daily)
+  - datalake/daily_hot.parquet            (joined latest rows)
+  - datalake/intraday/5m/<SYMBOL>.csv     (today 5m)
+  - datalake/macro/macro.parquet          (INDIAVIX/DXY/INR via Yahoo)
 """
-
 from __future__ import annotations
-import os, time, math, traceback
-from datetime import datetime, timedelta, timezone
+import os, time, traceback
 from pathlib import Path
 from typing import List, Dict, Any
 
 import pandas as pd
 import numpy as np
 
+from config import CONFIG
+
+# optional imports
 try:
     import yfinance as yf
 except Exception:
     yf = None
 
-from config import CONFIG
+# NSE helper
+try:
+    from data_sources.nse_client import daily_equity as nse_daily, intraday_5m_today as nse_5m
+except Exception:
+    nse_daily = nse_5m = None
 
 DL = Path(CONFIG["paths"]["datalake"])
 PER = DL / "per_symbol"
 INTRA5 = DL / "intraday" / "5m"
 MACRO = DL / "macro"
-LOGDIR = Path(CONFIG["paths"]["reports"]) / "debug"
-for p in [DL, PER, INTRA5, MACRO, LOGDIR]:
+RPTDBG = Path(CONFIG["paths"]["reports"]) / "debug"
+for p in [DL, PER, INTRA5, MACRO, RPTDBG]:
     p.mkdir(parents=True, exist_ok=True)
-
-def _utc_now():
-    return datetime.now(timezone.utc).isoformat()
 
 def _log(msg: str):
     print(f"[INGEST] {msg}")
 
-def _save_debug(name: str, obj: Any):
-    try:
-        (LOGDIR / f"{name}.txt").write_text(str(obj))
-    except Exception:
-        pass
+def _yahoo_daily(sym: str, period: str) -> pd.DataFrame:
+    if yf is None: return pd.DataFrame()
+    t = f"{sym}.NS" if not sym.endswith(".NS") else sym
+    df = yf.download(t, period=period, interval="1d", progress=False)
+    if df is None or df.empty: return pd.DataFrame()
+    df = df.reset_index()
+    if "Date" in df.columns: df.rename(columns={"Date":"date"}, inplace=True)
+    df.rename(columns={"Open":"open","High":"high","Low":"low","Close":"close","Adj Close":"adj_close","Volume":"volume"}, inplace=True)
+    df["symbol"] = sym.replace(".NS","")
+    return df[["date","open","high","low","close","adj_close","volume","symbol"]]
 
-def _yf_download(symbol: str, period="2y", interval="1d"):
-    if yf is None:
-        raise RuntimeError("yfinance not installed")
-    return yf.download(symbol, period=period, interval=interval, progress=False)
+def _yahoo_5m_today(sym: str, interval: str) -> pd.DataFrame:
+    if yf is None: return pd.DataFrame()
+    t = f"{sym}.NS" if not sym.endswith(".NS") else sym
+    df = yf.download(t, period="5d", interval=interval, progress=False)
+    if df is None or df.empty: return pd.DataFrame()
+    df = df.reset_index().rename(columns={"Datetime":"datetime","Open":"open","High":"high","Low":"low","Close":"close","Adj Close":"adj_close","Volume":"volume"})
+    if "datetime" not in df.columns: return pd.DataFrame()
+    df["date"] = pd.to_datetime(df["datetime"]).dt.date
+    today = df[df["date"] == df["date"].max()].copy()
+    return today[["datetime","open","high","low","close","volume"]]
 
-def _normalize_df(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame()
-    df = df.reset_index().copy()
-    if "Date" in df.columns:
-        df.rename(columns={"Date": "date"}, inplace=True)
-    if "Datetime" in df.columns:
-        df.rename(columns={"Datetime": "datetime"}, inplace=True)
-    # Standard columns
-    for a, b in {
-        "Open": "open", "High": "high", "Low": "low", "Close": "close",
-        "Adj Close": "adj_close", "Volume": "volume"
-    }.items():
-        if a in df.columns:
-            df.rename(columns={a: b}, inplace=True)
-    return df
+def backfill_daily(universe: List[str], period: str) -> Dict[str, Any]:
+    src = CONFIG["data_sources"]["primary"]
+    fb  = CONFIG["data_sources"]["fallback"]
+    out = {"ok": True, "written": 0, "source_counts": {"nse":0,"yahoo":0}}
+    latest = []
+    for raw in universe:
+        sym = raw.replace(".NS","")
+        df = pd.DataFrame()
+        # NSE first
+        if src == "nse" and nse_daily is not None:
+            try:
+                df = nse_daily(sym)
+                if not df.empty:
+                    out["source_counts"]["nse"] += 1
+                    # backfill via yahoo to add OHLC if available
+                    ydf = _yahoo_daily(sym, period) if yf else pd.DataFrame()
+                    if not ydf.empty:
+                        # merge close from NSE with OHLC from Yahoo by date
+                        df = pd.merge(ydf, df[["date","close"]], on="date", how="left", suffixes=("","_nse"))
+                        df["close"] = df["close_nse"].fillna(df["close"])
+                        df.drop(columns=[c for c in df.columns if c.endswith("_nse")], inplace=True)
+            except Exception as e:
+                _log(f"NSE daily fail {sym}: {e}")
+        # Fallback
+        if df.empty and fb == "yahoo":
+            df = _yahoo_daily(sym, period)
 
-def backfill_daily(universe: List[str], period: str = "2y") -> Dict[str, Any]:
-    """Daily OHLCV per symbol -> per_symbol/*.csv and daily_hot.parquet (joined latest)"""
-    out = {"ok": True, "written": 0, "universe": len(universe)}
-    latest_rows = []
-    for sym in universe:
-        try:
-            df = _yf_download(sym, period=period, interval="1d")
-            df = _normalize_df(df)
-            if df.empty:
-                _log(f"{sym}: no daily data")
-                continue
-            df["symbol"] = sym
-            # persist per-symbol rolling file
-            fp = PER / f"{sym}.csv"
-            if fp.exists():
-                try:
-                    old = pd.read_csv(fp)
-                    df = pd.concat([old, df]).drop_duplicates(subset=["date"], keep="last")
-                except Exception:
-                    pass
-            df.to_csv(fp, index=False)
-            out["written"] += 1
-            latest_rows.append(df.sort_values("date").iloc[-1])
-            time.sleep(float(CONFIG.get("ingest", {}).get("rate_limit_sec", 1.0)))
-        except Exception as e:
-            _log(f"{sym}: daily error: {e}")
-            traceback.print_exc()
+        if df.empty:
+            _log(f"{sym}: no daily data from any source")
+            continue
 
-    if latest_rows:
-        hot = pd.DataFrame(latest_rows)
-        # ensure types
+        # persist per_symbol
+        fp = PER / f"{sym}.csv"
+        if fp.exists():
+            try:
+                old = pd.read_csv(fp)
+                df = pd.concat([old, df]).drop_duplicates(subset=["date"], keep="last")
+            except Exception:
+                pass
+        df.to_csv(fp, index=False)
+        out["written"] += 1
+        latest.append(df.sort_values("date").iloc[-1])
+        time.sleep(float(CONFIG["data_sources"]["yahoo"]["rate_limit_sec"]))
+    if latest:
+        hot = pd.DataFrame(latest)
         hot["date"] = pd.to_datetime(hot["date"])
-        hot["volume"] = pd.to_numeric(hot["volume"], errors="coerce").fillna(0).astype("int64")
+        # guard columns
+        for c in ["open","high","low","close","adj_close","volume"]:
+            if c not in hot.columns: hot[c] = np.nan if c!="volume" else 0
         hot.to_parquet(DL / "daily_hot.parquet", index=False)
         _log(f"daily_hot.parquet rows={len(hot)}")
-    else:
-        _log("No latest rows -> daily_hot.parquet not updated")
-
     return out
 
 def fetch_intraday_today(universe: List[str], interval="5m", max_symbols: int = 60) -> Dict[str, Any]:
-    """Fetch *today's* intraday bars (5m) and store one CSV per symbol."""
-    out = {"ok": True, "interval": interval, "written": 0}
-    if interval != "5m":
-        raise ValueError("Only 5m supported in this helper")
-
-    # If weekend/holiday, yfinance may return empty sets — we still write an empty heartbeat file.
+    src = CONFIG["data_sources"]["primary"]
+    fb  = CONFIG["data_sources"]["fallback"]
+    out = {"ok": True, "written": 0, "source_counts": {"nse":0,"yahoo":0}}
     count = 0
-    for sym in universe[:max_symbols]:
-        try:
-            df = _yf_download(sym, period="5d", interval=interval)  # 5d window to catch today
-            df = _normalize_df(df)
-            if df.empty:
-                (INTRA5 / f"{sym}.csv").write_text("") if not (INTRA5 / f"{sym}.csv").exists() else None
-                continue
-            df["datetime"] = pd.to_datetime(df["datetime"])
-            today = df[df["datetime"].dt.date == df["datetime"].dt.date.max()].copy()
-            if today.empty:
-                (INTRA5 / f"{sym}.csv").write_text("") if not (INTRA5 / f"{sym}.csv").exists() else None
-            else:
-                today.to_csv(INTRA5 / f"{sym}.csv", index=False)
-                out["written"] += 1
-            count += 1
-            time.sleep(float(CONFIG.get("ingest", {}).get("rate_limit_sec", 1.0)))
-        except Exception as e:
-            _log(f"{sym}: intraday error: {e}")
-            traceback.print_exc()
+    for raw in universe[:max_symbols]:
+        sym = raw.replace(".NS","")
+        df = pd.DataFrame()
+        # NSE first
+        if src == "nse" and nse_5m is not None:
+            try:
+                df = nse_5m(sym)
+                if not df.empty:
+                    out["source_counts"]["nse"] += 1
+            except Exception as e:
+                _log(f"NSE 5m fail {sym}: {e}")
+        # Fallback
+        if df.empty and fb == "yahoo":
+            df = _yahoo_5m_today(sym, interval)
+            if not df.empty: out["source_counts"]["yahoo"] += 1
+
+        # write (even empty file once for heartbeat)
+        fp = INTRA5 / f"{sym}.csv"
+        if df.empty and not fp.exists():
+            fp.write_text("")
+        elif not df.empty:
+            df.to_csv(fp, index=False)
+            out["written"] += 1
+
+        count += 1
+        time.sleep(float(CONFIG["data_sources"]["yahoo"]["rate_limit_sec"]))
     return out
 
 def fetch_macro() -> Dict[str, Any]:
-    """Fetch India VIX (proxy), DXY, USDINR; store to macro/macro.parquet."""
+    """Macro (INDIAVIX/DXY/INR) via Yahoo"""
     out = {"ok": True, "rows": 0}
-    series = {
-        "india_vix": "^INDIAVIX",
-        "dxy": "DX-Y.NYB",
-        "usdinr": "USDINR=X"
-    }
+    if yf is None: return out
+    series = {"india_vix": "^INDIAVIX", "dxy": "DX-Y.NYB", "usdinr": "USDINR=X"}
     rows = []
     for name, tkr in series.items():
         try:
-            df = _yf_download(tkr, period="2y", interval="1d")
-            df = _normalize_df(df)
-            if df.empty: continue
-            s = df[["date","close"]].copy()
+            df = yf.download(tkr, period=CONFIG["data_sources"]["yahoo"]["daily_period"], interval="1d", progress=False)
+            if df is None or df.empty: continue
+            s = df.reset_index()[["Date","Close"]].rename(columns={"Date":"date","Close":"close"})
             s["series"] = name
             rows.append(s)
             time.sleep(0.6)
@@ -163,25 +172,14 @@ def fetch_macro() -> Dict[str, Any]:
     return out
 
 def run_all(universe: List[str]) -> Dict[str, Any]:
-    """Convenience wrapper used by workflows."""
-    if not universe:
-        universe = CONFIG.get("universe", [])
-    _log(f"run_all universe={len(universe)}")
-    res_d = backfill_daily(universe, period=CONFIG.get("ingest",{}).get("daily_period","2y"))
-    res_i = fetch_intraday_today(universe, interval="5m",
-                                 max_symbols=int(CONFIG.get("ingest",{}).get("intraday",{}).get("max_symbols", 60)))
+    if not universe: universe = CONFIG.get("universe", [])
+    _log(f"run_all NSE-first universe={len(universe)}")
+    res_d = backfill_daily(universe, period=CONFIG["data_sources"]["yahoo"]["daily_period"])
+    res_i = fetch_intraday_today(universe,
+                                 interval=CONFIG["data_sources"]["nse"]["intraday_interval"],
+                                 max_symbols=int(CONFIG["data_sources"]["nse"]["max_intraday_symbols_per_run"]))
     res_m = fetch_macro()
-    out = {
-        "when": _utc_now(),
-        "daily": res_d,
-        "intraday": res_i,
-        "macro": res_m,
-        "paths": {
-            "per_symbol": str(PER),
-            "daily_hot": str(DL / "daily_hot.parquet"),
-            "intraday_5m": str(INTRA5),
-            "macro": str(MACRO / "macro.parquet"),
-        }
-    }
-    _save_debug("ingest_summary", out)
+    out = {"daily": res_d, "intraday": res_i, "macro": res_m}
+    (RPTDBG / "ingest_summary.txt").write_text(str(out))
+    print(out)
     return out
