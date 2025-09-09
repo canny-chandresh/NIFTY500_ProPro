@@ -1,15 +1,18 @@
-name: Nightly Heavy (DL/Backtests/Calibration)
+name: Nightly Heavy (Train + Discovery)
+
 on:
   schedule:
-    - cron: "30 18 * * 1-5"   # 00:00 IST approx (adjust as desired)
+    # ~16:05 UTC = 21:35 IST — after market close & EOD settles. Adjust as needed.
+    - cron: "5 16 * * 1-5"
   workflow_dispatch: {}
 
 jobs:
-  heavy:
+  nightly:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    timeout-minutes: 60
+    timeout-minutes: 90
+    env:
+      TZ: Asia/Kolkata
+      PYTHONUNBUFFERED: "1"
 
     steps:
       - name: Checkout
@@ -20,12 +23,17 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps (DL-capable)
+      - name: Install deps (heavy)
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          pip install yfinance pandas numpy scikit-learn xgboost catboost pyyaml requests || true
+          pip install pandas numpy scikit-learn pyarrow fastparquet yfinance ta pyyaml
+          pip install feedparser vaderSentiment || true
+          # boosters + DL stacks
+          pip install xgboost lightgbm catboost
+          pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+          pip install einops torchmetrics
 
+      # ---------- DATA REFRESH ----------
       - name: Ensure recent data is present
         run: |
           python - <<'PY'
@@ -36,34 +44,70 @@ jobs:
           print(di.run_all(uni))
           PY
 
-      - name: (Placeholder) Train DL/Boosters/Stacker/Calib
-        run: |
-          python - <<'PY'
-          # Keep it short for now; your existing private trainers can be dropped here later.
-          import json, os, sys
-          from pathlib import Path
-          sys.path.append("src")
-          from config import CONFIG
-          BASE = Path(CONFIG["paths"]["datalake"])/"features_runtime"
-          for d in ["dl_ft","dl_tcn","dl_tst","meta","calibration","boosters"]:
-            (BASE/d).mkdir(parents=True, exist_ok=True)
-          # Touch artifacts to enable engines (you will replace with real training artifacts)
-          (BASE/"dl_ft"/"ft_transformer.pt").write_text("stub")
-          (BASE/"dl_tcn"/"tcn.pt").write_text("stub")
-          (BASE/"dl_tst"/"tst.pt").write_text("stub")
-          (BASE/"meta"/"stacker.json").write_text(json.dumps({"ml":0.2,"boost":0.5,"ft":0.3,"tcn":0.2,"tst":0.3}))
-          (BASE/"calibration"/"platt.json").write_text(json.dumps({"a":1.0,"b":0.0,"sigma":0.15}))
-          print("Artifacts touched (stubs) – replace with real models when ready.")
-          PY
-
-      - name: Auto Bug Fix (safe, non-fatal)
+      # ---------- FULL ALPHAS (nightly, not just fast) ----------
+      - name: Compute all alphas (nightly)
         run: |
           python - <<'PY'
           import sys; sys.path.append("src")
-          import json
-          try:
-            from auto_bugfixer import main
-            print("AUTO_FIX:", json.dumps(main(), indent=2))
-          except Exception as e:
-            print("Autofix missing:", e)
+          from config import CONFIG
+          import feature_store
+          from alpha.runtime import run_enabled_alphas
+          ff = feature_store.get_feature_frame(CONFIG.get("universe", []))
+          out = run_enabled_alphas(ff, fast_only=False)
+          print({"alpha_cols": [c for c in out.columns if c.startswith("alpha_")]})
           PY
+
+      # ---------- ANOMALY (IsolationForest) ----------
+      - name: Anomaly detection
+        run: |
+          python - <<'PY'
+          import sys; sys.path.append("src")
+          from config import CONFIG
+          import feature_store
+          from engines.anomaly_iforest import run as run_anom
+          ff = feature_store.get_feature_frame(CONFIG.get("universe", []))
+          print(run_anom(ff))
+          PY
+
+      # ---------- DISCOVERY (nightly; weekly job uses same scheduler with longer horizon) ----------
+      - name: Discovery & (optional) Auto-Promote
+        run: |
+          python - <<'PY'
+          import sys; sys.path.append("src")
+          from discovery.discovery_scheduler import nightly
+          print(nightly())
+          PY
+
+      # ---------- BOOTSTRAP HEAVY ENGINES ----------
+      - name: Bootstrap & Train heavy engines
+        run: |
+          python - <<'PY'
+          import sys; sys.path.append("src")
+          from engines.bootstrap_heavy import run
+          print(run())
+          PY
+
+      # ---------- PERIODIC REPORTS (weekly/monthly if boundary) ----------
+      - name: Periodic reports (weekly/monthly)
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID:  ${{ secrets.TG_CHAT_ID }}
+        run: |
+          python - <<'PY'
+          import sys; sys.path.append("src")
+          from entrypoints import periodic_reports_task, after_run_housekeeping
+          periodic_reports_task()
+          after_run_housekeeping()
+          PY
+
+      # ---------- ARTIFACTS ----------
+      - name: Upload nightly artifacts (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly_heavy_artifacts
+          path: |
+            models/**
+            reports/**
+            datalake/**
+          if-no-files-found: ignore
