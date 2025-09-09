@@ -1,140 +1,94 @@
 # -*- coding: utf-8 -*-
 """
 config.py
-Single source of truth for runtime flags, paths, universe, schedules, risk, notify,
-ingest, alpha/discovery, and hygiene controls. Other modules must import CONFIG.
+Central configuration for NIFTY500 ProPro screener v2.
+Edit universes, feature flags, and run-time knobs here.
 """
 
-from __future__ import annotations
 from pathlib import Path
 
-# ---------- Paths ----------
-ROOT = Path(".")
-DATA_DIR = ROOT / "datalake"
-REPORTS_DIR = ROOT / "reports"
-
 CONFIG = {
+    # === Paths ===
     "paths": {
-        "root": str(ROOT.resolve()),
-        "datalake": str(DATA_DIR),
-        "reports": str(REPORTS_DIR),
+        "datalake": "datalake",
+        "reports": "reports",
+        "models": "models",
     },
 
-    # ---------- Universe ----------
-    # Keep this lean; you can expand in nightly to avoid rate-limits in day runs.
+    # === Trading Universe (customize your stock list) ===
     "universe": [
-        "RELIANCE","TCS","INFY","HDFCBANK","ICICIBANK",
-        "SBIN","HINDUNILVR","LT","ITC","AXISBANK",
-        # add more symbols as you like
+        "RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", "ICICIBANK.NS",
+        "AXISBANK.NS", "LT.NS", "SBIN.NS", "KOTAKBANK.NS", "ITC.NS"
     ],
 
-    # ---------- Feature Flags (core) ----------
-    "features": {
-        "regime_v1": True,
-        "sr_pivots_v1": True,
-        "options_sanity": True,
-        "reports_v1": True,
-        "killswitch_v1": True,
-        "walkforward_v1": True,
-        "drift_alerts": True,
-        "status_cmd": True,
+    # === Ingestion knobs ===
+    "ingest": {
+        "daily_period": "2y",         # backfill horizon
+        "rate_limit_sec": 1.0,        # polite throttle to Yahoo
+        "intraday": {
+            "max_symbols": 60,        # limit intraday symbols/hour
+        }
     },
 
-    # ---------- Notification / Schedules ----------
+    # === Notifications (Telegram) ===
     "notify": {
-        # 3:15 PM IST picks window (send only within ±window_min)
         "send_only_at_ist": True,
-        "ist_send_hour": 15,
+        "ist_send_hour": 15,      # 3:15pm picks
         "ist_send_min": 15,
         "window_min": 3,
-        # End-of-day summary ~16:05 IST
-        "ist_eod_hour": 16,
-        "ist_eod_min": 5,
-        "eod_window_min": 7,
-        # For testing: force to send every run (overrides window guard)
-        "force_every_run": False,
-        # Debug echo to logs
-        "debug_echo": True,
+        "ist_eod_hour": 17,       # 5:00pm daily EOD summary
+        "ist_eod_min": 0,
+        "eod_window_min": 10,
     },
 
-    # ---------- Ingest (Phase-2 extractors will read this; safe to keep here) ----------
-    "ingest": {
-        "rate_limit_sec": 1.2,
-        "daily": {"enabled": True, "lookback_days": 750},  # ~3Y for day runs
-        "intraday": {"enabled": True, "bar": "5m", "max_symbols": 200, "period": "5d"},
-        "options": {"enabled": True, "underlyings": ["NIFTY","BANKNIFTY"], "snap_expiries": 2, "max_strikes": 15},
-        "macro": {
+    # === Engines toggle ===
+    "engines": {
+        "ml": {"enabled": True},                       # base ML
+        "boosters": {"enabled": True, "models": ["xgb", "lgbm", "cb"]},
+        "dl": {
             "enabled": True,
-            "tickers": {
-                "india_vix": "^INDIAVIX",
-                "dxy": "DX-Y.NYB",
-                "us10y": "^TNX",
-                "wti": "CL=F",
-                "gold": "GC=F",
-                "usdinr": "USDINR=X",
-                "gift_nifty": "^GIFNIFTY"
-            }
-        }
+            "ft": {"enabled": True},                  # FT-Transformer
+            "tcn": {"enabled": True},                 # Temporal ConvNet
+            "tst": {"enabled": True},                 # TimeSeries Transformer
+        },
+        "calibration": {"enabled": True},             # Platt/Isotonic
+        "stacker": {"enabled": True},                 # Meta-model
     },
 
-    # ---------- Matrix spec ----------
-    # matrix.py will auto-create this file with defaults if missing.
-    "feature_spec_file": str(DATA_DIR / "feature_spec.yaml"),
-
-    # ---------- Alpha layer (plugins) ----------
-    "alpha": {
-        "enabled": True,
-        "shadow_only": True,           # start in shadow; promotions happen after nightly checks
-        "fast_hourly": ["alpha_gap_decay"],
-        "heavy_nightly": ["alpha_pair_flow","alpha_event_guard"],
-        "promotion": {
-            "min_days": 10,
-            "min_ic": 0.03,
-            "max_dd_pct": 8.0,
-            "review_required": True
-        }
-    },
-
-    # ---------- Risk / Sizing (used by pipeline_ai) ----------
-    "risk": {
-        "kelly_fraction": 0.25,        # Kelly-lite
-        "max_notional_per_trade": 200000.0,
-        "min_notional_per_trade": 20000.0,
-        "per_trade_var_cap_pct": 0.02,
-        "slippage_bps": 8.0,
-        "fees_bps": 3.0,
-        "atr_stop_mult": 1.2,          # can be adjusted by ATR policy
-        "atr_target_mult": 2.0,
-    },
-
-    # ---------- Kill switch ----------
+    # === Kill-switch and thresholds ===
     "killswitch": {
         "enabled": True,
-        "hit_rate_floor_pct": 30.0,      # if < 30% for N consecutive days -> pause signals
-        "consecutive_days": 3,
-        "cooldown_days": 2
+        "min_winrate": 0.30,          # if <30% for N consecutive days, kill
+        "days": 3,
+        "cooldown_days": 2,
     },
 
-    # ---------- Discovery (feature R&D) ----------
+    # === Discovery engine ===
     "discovery": {
         "enabled": True,
-        "sources": {
-            "news": [],                  # add RSS/API urls to activate
-        },
-        "max_new_features_per_night": 3,
-        "auto_promote": False,           # keep manual review by default
-        "safety": {"leak_checks": True}
+        "auto_promote": True,          # auto add candidates if stable
+        "min_corr": 0.2,               # minimum correlation with returns
+        "stability_window": 60,        # days for drift/stability
     },
 
-    # ---------- Diagnostics / Hygiene ----------
-    "diagnostics": {
-        "echo_pythonpath": False
+    # === Features & Flags ===
+    "features": {
+        "regime_v1": True,
+        "options_sanity": True,
+        "sr_pivots_v1": True,          # Support/Resistance + Gaps
+        "status_cmd": True,
+        "reports_v1": True,
+        "killswitch_v1": True,
+        "drift_alerts": True,
+        "walkforward_v1": True,
+        "smart_money": True,
+        "alpha_runtime": True,         # intraday-safe alphas
+        "alpha_nightly": True,         # full alpha suite
+        "anomaly_iforest": True,       # anomaly detector
+        "news_sentiment": True,        # hourly news signal
     },
 
-    # ---------- Auto bug fixer ----------
-    "autofix": {
-        "enabled": True,
-        "dry_run": False,
-        "write_issue": False
-    },
+    # === Minimum samples for heavy engines ===
+    "min_samples_for_heavy": 2000,
+    "min_days_history": 250,
 }
