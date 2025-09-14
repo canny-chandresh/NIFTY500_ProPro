@@ -115,20 +115,16 @@ jobs:
             except Exception as e: print("Monthly report error:", e)
           PY
 
-      # ✅ Optional nightly healthcheck too (same path-safe import)
-      - name: Nightly Healthcheck (no-telegram)
-        run: |
-          python - <<'PY'
-          import sys; sys.path.append("src")
-          try:
-            import healthcheck
-            if hasattr(healthcheck, "main"):
-              healthcheck.main(send_telegram=False)
-            elif hasattr(healthcheck, "run"):
-              healthcheck.run(send_telegram=False)
-          except Exception as e:
-            print("nightly healthcheck error:", e)
-          PY
+- name: Healthcheck + Telegram (wrapped)
+  env:
+    TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+    TG_CHAT_ID:  ${{ secrets.TG_CHAT_ID }}
+  run: |
+    python - <<'PY'
+    import sys; sys.path.append("src")
+    import hc_runner
+    hc_runner.main(send_telegram=True)
+    PY
 
       - name: Upload nightly artifacts (always)
         if: always()
